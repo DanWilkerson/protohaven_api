@@ -54,6 +54,7 @@ neon:
       enabled: ${NEW_MEMBERSHIP_ENABLED}
       include_filter: ${NEW_MEMBERSHIP_INCLUDE_CSV}
       excluded_membership_types: ${EXCLUDED_MEMBERSHIP_TYPES}
+      additional_targets: ${NEW_MEMBERSHIP_ADDITIONAL_TARGETS}
   # Membership automation settings
   automation:
     default_coupon_amount_usd: 75
@@ -122,6 +123,7 @@ nocodb:
       boilerplate: "m956in9b8grmer1"
       availability: "ms8jby3zcv0s3jo"
       discounts: "mstauhc7ovslglt"
+      quiz_results: "mqnrh78uhi9jeq9"
     policy_enforcement:
       sections: "mxq6xd6e7nqmnm0"
       violations: "m1jbelb76ix3cn4"
@@ -182,6 +184,7 @@ airtable:
       boilerplate: "tblZDWOcljKw0OnwN"
       availability: "tbl4tOuZKNJduN4LC"
       discounts: "tbllyGvxfAFYsocN0"
+      quiz_results: "tblFqvQsozEr4rI34"
     policy_enforcement:
       token: ${AIRTABLE_TOKEN_POLICY_ENFORCEMENT}
       base_id: "apppMbG0r1ZrluVMv"

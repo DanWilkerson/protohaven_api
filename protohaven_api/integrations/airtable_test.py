@@ -509,25 +509,16 @@ def test_fetch_instructor_teachable_classes(mocker):
         {
             "fields": {
                 "Instructor": "  John Doe  ",
-                "Schedulable": True,
                 "Class": ["class1", "class2"],
             }
         },
         {
             "fields": {
                 "Instructor": "jane smith",
-                "Schedulable": True,
                 "Class": ["class3"],
             }
         },
-        {
-            "fields": {
-                "Instructor": "bob wilson",
-                "Schedulable": False,
-                "Class": ["class4"],
-            }
-        },
-        {"fields": {"Schedulable": True, "Class": ["class5"]}},
+        {"fields": {"Class": ["class5"]}},
     ]
 
     mocker.patch.object(a, "get_all_records", return_value=mock_records)
@@ -535,3 +526,33 @@ def test_fetch_instructor_teachable_classes(mocker):
 
     expected = {"john doe": ["class1", "class2"], "jane smith": ["class3"]}
     assert got == expected
+
+
+def test_insert_quiz_result(mocker):
+    """Test inserting quiz result into Airtable"""
+    mock_insert = mocker.patch.object(a, "insert_records")
+    submitted = d(0)
+    email = "test@example.com"
+    tool_codes = ["LS1", "LS2"]
+    data = {"question": "test", "answer": "correct"}
+    points_scored = 8
+    points_to_pass = 6
+
+    a.insert_quiz_result(
+        submitted, email, tool_codes, data, points_scored, points_to_pass
+    )
+
+    mock_insert.assert_called_once_with(
+        [
+            {
+                "Submitted": submitted.isoformat(),
+                "Email": email,
+                "Tool Codes": "LS1,LS2",
+                "Data": '{"question": "test", "answer": "correct"}',
+                "Points Scored": points_scored,
+                "Points to Pass": points_to_pass,
+            }
+        ],
+        "class_automation",
+        "quiz_results",
+    )

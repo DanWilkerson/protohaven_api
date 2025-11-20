@@ -7,6 +7,9 @@ import re
 from collections import defaultdict
 from enum import Enum
 from functools import lru_cache
+import threading
+import locale
+
 
 from protohaven_api.automation.classes import events as eauto
 from protohaven_api.config import (  # pylint: disable=import-error
@@ -22,6 +25,9 @@ from protohaven_api.integrations.comms import Msg
 
 log = logging.getLogger("class_automation.builder")
 
+LOCALE_LOCK = threading.Lock()
+with LOCALE_LOCK:
+    locale.setlocale(locale.LC_ALL, 'en_US.UTF-8')
 
 @lru_cache(maxsize=30)
 def get_account_email(account_id):
@@ -53,7 +59,7 @@ def get_unscheduled_instructors(start, end, require_active=True):
         require_teachable_classes=True,
         require_active=require_active,
     ).items():
-        if already_scheduled[email.lower()]:
+        if already_scheduled[email.lower().strip()]:
             continue  # Don't nag folks that already have their classes set up
         yield (name, email)
 
@@ -66,7 +72,7 @@ def gen_class_scheduled_alerts(scheduled_by_instructor):
         start = safe_parse_datetime(cls["fields"]["Start Time"])
         return {
             "t": start,
-            "start": start.strftime("%b %d %Y, %-I%P"),
+            "start": start.strftime("%b %d %Y, %-I%p"),
             "name": cls["fields"]["Name (from Class)"][0],
             "inst": cls["fields"]["Instructor"] if inst else None,
         }
@@ -219,7 +225,8 @@ class ClassEmailBuilder:  # pylint: disable=too-many-instance-attributes
             self.push_class(evt, Action.CONFIRM, "override")
         else:
             log.info(
-                f"Checking actions needed for class {evt.name} - {evt.attendee_count} attendees"
+                f"Checking actions needed for #{evt.neon_id} {evt.name} "
+                f"({evt.attendee_count} attendees)"
             )
             for action in Action:
                 if action.needed_for(evt, now):
@@ -285,6 +292,9 @@ class ClassEmailBuilder:  # pylint: disable=too-many-instance-attributes
 
     def _build_registrant_notification(self, evt, action, a):
         """Build notification for a registrant `a` about event `evt`"""
+        if a.email is None:
+            self.log.error(f"Skipping email to attendee {a.fname}; no email given")
+            return
         if self.notified(a.email, evt, action.day_offset):
             self.log.debug(
                 f"Skipping email to attendee {a.fname} ({a.email}); already notified"
