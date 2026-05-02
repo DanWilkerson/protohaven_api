@@ -4,7 +4,8 @@ import { Button, Row, Tooltip, Col, Card, CardHeader, CardTitle, CardSubtitle, C
 import {get, post} from '$lib/api.ts';
 import FetchError from '../fetch_error.svelte';
 
-export let eid;
+export let schedule_id;
+export let submissions;
 
 export let c_init;
 let meta_promise = Promise.resolve(c_init);
@@ -22,6 +23,13 @@ function fetch_neon_state(data) {
     });
   }
   return null;
+}
+
+// Get submission timestamps for this class
+function getSubmissionTimestamps(classData) {
+  if (!submissions || submissions instanceof Error) return [];
+  if (!classData.neon_id || !(classData.neon_id in submissions)) return [];
+  return submissions[classData.neon_id];
 }
 
 function fetch_attendees(data) {
@@ -47,7 +55,7 @@ function refresh(neon_id) {
 //onMount(refresh);
 
 function confirm(pub) {
-  meta_promise = post("/instructor/class/update", {eid, pub})
+  meta_promise = post("/instructor/class/update", {eid: schedule_id, pub})
   promise = meta_promise.then(fetch_attendees);
   state_promise = meta_promise.then(fetch_neon_state);
 }
@@ -55,7 +63,7 @@ function confirm(pub) {
 function submit_log(url) {
   let attendees_for_log = [];
   for (let d of attendees) {
-    attendees_for_log.push(`${d.firstName} ${d.lastName} (${d.email})`);
+    attendees_for_log.push(`${d.name} (${d.email})`);
   }
   console.log("Attendees:", attendees_for_log);
   url = url.replace("ATTENDEE_NAMES", encodeURIComponent(attendees_for_log.join(", ")));
@@ -64,13 +72,13 @@ function submit_log(url) {
 }
 
 function supply(ok) {
-  meta_promise = post("/instructor/class/supply_req", {eid, missing: !ok})
+  meta_promise = post("/instructor/class/supply_req", {eid: schedule_id, missing: !ok})
   promise = meta_promise.then(fetch_attendees);
   state_promise = meta_promise.then(fetch_neon_state);
 }
 
 function volunteer(v) {
-  meta_promise = post("/instructor/class/volunteer", {eid, volunteer: v})
+  meta_promise = post("/instructor/class/volunteer", {eid: schedule_id, volunteer: v})
   promise = meta_promise.then(fetch_attendees);
   state_promise = meta_promise.then(fetch_neon_state);
 }
@@ -87,16 +95,28 @@ function cancel(class_id) {
 {:then c}
 <Card class="my-3" size={'lg'}>
 <CardHeader style={(c.neon_id) ? "background-color: rgb(230, 225, 249)" : ""}>
-  <CardTitle id={eid}>
+  <CardTitle id={schedule_id}>
     {#if c.neon_id}
       <i class="bi bi-calendar-check"></i>
     {:else}
       <a href="https://protohaven.org/wiki/instructors#scheduling" target="_blank"><i class="bi bi-question-circle"></i></a> PROPOSED:
     {/if}
     {c.name}
+    {#if getSubmissionTimestamps(c).length > 0}
+      <span class="badge bg-success ms-2" title="Log submitted">
+        <i class="bi bi-check-circle"></i> Logged
+        {#if getSubmissionTimestamps(c).length > 1}
+          ({getSubmissionTimestamps(c).length}x)
+        {/if}
+      </span>
+    {:else if c.neon_id}
+      <span class="badge bg-warning ms-2" title="No log submitted yet">
+        <i class="bi bi-exclamation-circle"></i> Not Yet Logged
+      </span>
+    {/if}
   </CardTitle>
   {#if !c.neon_id}
-  <Tooltip target={eid} placement="right">
+  <Tooltip target={schedule_id} placement="right">
   	Proposed classes are not guaranteed to run; they aren't yet available for people to register in Neon. Click the ? icon for more details.
   </Tooltip>
   {/if}
@@ -110,7 +130,7 @@ function cancel(class_id) {
       <Alert color='warning'>This class has been canceled.</Alert>
     {/if}
   {:catch error}
-    Error: {error.message}
+    <Alert color="warning" class="mx-3">Error fetching state from Neon: {error.message.substr(0,128)}</Alert>
   {/await}
 
   {#if c.rejected}
@@ -139,10 +159,13 @@ function cancel(class_id) {
       <ul class="attendees">
 	{#each p as a}
 	<li>
-      {#if a.registrationStatus !== "SUCCEEDED" }
-      <strong>{a.registrationStatus}</strong> -
+      {#if a.neon_raw_data && a.neon_raw_data.registrationStatus !== "SUCCEEDED" }
+      <strong>{a.neon_raw_data.registrationStatus}</strong> -
       {/if}
-      {a.firstName} {a.lastName} ({a.email}) registered {a.registrationDate}
+      {a.name} ({a.email})
+      {#if a.neon_raw_data && a.neon_raw_data.registrationDate}
+        registered {a.neon_raw_data.registrationDate}
+      {/if}
   </li>
 	{/each}
       </ul>
@@ -162,8 +185,26 @@ function cancel(class_id) {
     {/if}
   </li>
   <li>Instruction: {#if c.volunteer}Volunteer (no pay){:else}Paid{/if} </li>
-  <li>Instructor confirmed:  {#if c.confirmed}on {new Date(c.confirmed).toLocaleString()}{:else}no{/if}</li>
+  {#if c.confirmed}
+    <li>Proposed {new Date(c.confirmed).toLocaleString()}</li>
+  {/if}
   </ul>
+
+  {#if c.neon_id}
+    <div>Log submissions:</div>
+    <ul>
+      {#if getSubmissionTimestamps(c)}
+        {#each getSubmissionTimestamps(c) as timestamp, i}
+          <li>Submitted: {new Date(timestamp).toLocaleString()}</li>
+        {/each}
+      {:else if submissions instanceof Error}
+        <Alert color='warning'>{submissions}</Alert>
+      {:else}
+        <li><em>No log submissions yet</em></li>
+      {/if}
+    </ul>
+  {/if}
+
   {#if c.clearances.length > 0}
   <div>Clearances earned:</div>
   <ul>
@@ -206,11 +247,6 @@ function cancel(class_id) {
 
 
       {#if !c.neon_id}
-	{#if c.confirmed}
-	<DropdownItem on:click={() => confirm(null)}>Unconfirm</DropdownItem>
-	{:else}
-        <DropdownItem on:click={() => confirm(true)}>Confirm available</DropdownItem>
-	{/if}
 	<DropdownItem divider />
         <DropdownItem on:click={() => confirm(false)}>Mark unavailable (hides permanently)</DropdownItem>
       {:else}

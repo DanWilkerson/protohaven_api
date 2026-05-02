@@ -137,8 +137,9 @@ def _setup_test_event():
             [
                 {
                     "Instructor": "Cronicle",
+                    "Instructor ID": "0",
                     "Email": "hello@protohaven.org",
-                    "Start Time": start.isoformat(),
+                    "Sessions": start.isoformat(),
                     "Class": ["recyvKjNGHHCuHeFw"],  # wood 101
                     "Confirmed": tznow().isoformat(),
                     "Neon ID": evt_id,
@@ -257,7 +258,8 @@ if __name__ == "__main__":
                 "ARGS_EMAIL_OVERRIDE": EOVR,
                 "ARGS": (
                     "--start=2000-01-01 --end=2000-01-30 "
-                    "--no-require_active --filter=test@test.com"
+                    "--no-require_active --no-require_teachable "
+                    "--filter=hello+testmember@protohaven.org"
                 ),
             },
         ),
@@ -302,7 +304,11 @@ if __name__ == "__main__":
             "elvv9mdlx2j",
             {
                 "ARGS_CHAN_OVERRIDE": COVR,
-                "ARGS": "--no-apply",
+                "ARGS": (
+                    '--no-apply --exclude_areas="Class Supplies,Maintenance,"'
+                    "Staff Room,Back Yard,Rental Room,Maker Market,Rack Storage,"
+                    'Left Restroom,Right Restroom,Kitchen,Gallery,Custodial Room,All,Digital,Other"'
+                ),
             },
         ),
         # Note: need to create a test class to post and ensure all good.
@@ -415,6 +421,16 @@ if __name__ == "__main__":
                 "ARGS_CHAN_OVERRIDE": COVR,
                 "ARGS_EMAIL_OVERRIDE": EOVR,
                 "ARGS": "--no-apply --filter=1245",
+            },
+        ),
+        # Need to pre-reserve something that doesn't match an existing class entry
+        (
+            "cleanup_orphaned_class_reservations",
+            test_simple,
+            "emmtkylp1m7",
+            {
+                "ARGS_CHAN_OVERRIDE": COVR,
+                "ARGS": "--no-apply",
             },
         ),
     ]

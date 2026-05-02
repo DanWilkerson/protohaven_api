@@ -16,7 +16,7 @@
   <CardHeader>
     <div class="d-flex justify-content-between align-items-center">
       <CardTitle>{tech.name} ({tech.email})</CardTitle>
-      {#if isTechLead && !isCurrentUser}
+      {#if isTechLead}
         <Button
           color="danger"
           size="sm"
@@ -76,13 +76,13 @@
           />
           <EditCell
             title="Interest"
-            enabled={true}
+            enabled={isTechLead || isCurrentUser}
             on_change={() => onUpdate(tech)}
             bind:value={tech.interest}
           />
           <EditCell
             title="Expertise"
-            enabled={true}
+            enabled={isTechLead || isCurrentUser}
             on_change={() => onUpdate(tech)}
             bind:value={tech.expertise}
           />

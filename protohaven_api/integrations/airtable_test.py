@@ -439,17 +439,6 @@ def test_resolve_hours():
     assert a.Class.resolve_hours(None, None) == [0]
 
 
-def test_resolve_starts():
-    assert a.ScheduledClass.resolve_starts(d(0).isoformat(), None, None, None) == [d(0)]
-    assert a.ScheduledClass.resolve_starts(
-        f"{d(0).isoformat()}, {d(1).isoformat()}", None, None, None
-    ) == [d(0), d(1)]
-    assert a.ScheduledClass.resolve_starts(None, d(0).isoformat(), "2", "7") == [
-        d(0),
-        d(7),
-    ]
-
-
 def test_from_schedule(mocker):
     """Test converting airtable schedule row into ScheduledClass"""
     # Create a mock row with all required fields
@@ -510,6 +499,13 @@ def test_from_schedule(mocker):
         "Age Requirement": "18+",
     }
 
+    assert result.form_fmt_hours(-1) == "0"
+    assert result.form_fmt_hours(0.5) == "0.5"
+    assert result.form_fmt_hours(3.0) == "3"
+    assert result.form_fmt_hours(3.2) == "3"
+    assert result.form_fmt_hours(3.8) == "4"
+    assert result.form_fmt_hours(999) == "8"
+
 
 def test_from_template(mocker):
     """Test converting an airtable template row into Class"""
@@ -526,7 +522,7 @@ def test_from_template(mocker):
             "Approved": True,
             "Image Link": "http://example.com/image.jpg",
             "Form Name (from Clearance)": ["TS1"],
-            "Email (from Instructor Capabilities)": ["instructor@example.com"],
+            "Neon ID (from Instructor Capabilities)": ["12345"],
         },
     }
     result = a.Class.from_template(row)
@@ -542,4 +538,4 @@ def test_from_template(mocker):
     assert result.approved is True
     assert result.image_link == "http://example.com/image.jpg"
     assert result.clearances == ["TS1"]
-    assert result.approved_instructors == ["instructor@example.com"]
+    assert result.approved_instructors == ["12345"]

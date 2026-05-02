@@ -2,6 +2,7 @@ general:
   log_level: ${LOGLEVEL}
   yaml_out: ${YAML_OUT}
   server_mode: ${PH_SERVER_MODE}
+  db_mode: ${PH_DB_MODE}
   behind_proxy: false
   cors: ${CORS}
   session_secret: ${SESSION_SECRET}
@@ -52,6 +53,8 @@ neon:
   login_otp_code: ${NEON_LOGIN_OTP_CODE}
   waiver_expiration_days: 60
   waiver_published_date: "2023-03-14"
+  member_agreement_expiration_days: 60
+  member_agreement_published_date: "2026-12-16"
   webhooks:
     new_membership:
       enabled: ${NEW_MEMBERSHIP_ENABLED}
@@ -96,6 +99,7 @@ comms:
     edu-automation: ${WEBHOOK_EDU_AUTOMATION}
     supply-automation: ${WEBHOOK_SUPPLY_AUTOMATION}
     donation-automation: ${WEBHOOK_DONATION_AUTOMATION}
+    staff: ${WEBHOOK_STAFF}
   discord_roles:
     Staff: 1130895854769807520
     Techs: 801513013710422056
@@ -138,6 +142,7 @@ nocodb:
       sign_in_announcements: "mpq6eu6gljxpojl"
       sign_in_survey_responses: "m0ug87cgzm31t0b"
       sign_ins: "m5pqytb0n1ydtml"
+      storage_agreements: "mmwchfayszqjy8p"
       automation_intents: "m6h05qg8s18szjl"
       volunteers_staff: "mkygxd0r8l1yhah"
       recertification: "m1cksb6rz2fpwcw"
@@ -215,6 +220,7 @@ airtable:
       sign_in_announcements: "tblTv5DGemRkB424u"
       sign_in_survey_responses: "tbl6hPSnVBIXk8MQO"
       sign_ins: "tblVBhzeE3k9yYRn9"
+      storage_agreements: "tblFoG5HKnRfuZsD7"
       automation_intents: "tblBgXQlOFjNqvBVm"
       volunteers_staff: "tblgwvc07mvLg3zds"
       recertification: "tbljedHQ90LwttPGp"
@@ -239,6 +245,10 @@ square:
 asana:
   token: ${ASANA_TOKEN}
   gid: "1199692158232291"
+  webhooks:
+    purchase_requests:
+      enabled: ${ASANA_WEBHOOK_PURCHASE_REQUESTS_ENABLED}
+      target_url: ${ASANA_WEBHOOK_PURCHASE_REQUESTS_TARGET_URL}
   asset_disposal:
     gid: "1212438685613709"
     section_gids:
@@ -318,6 +328,7 @@ forms:
       email: "entry.1009036564"
       dependent_info: "entry.2120218255"
       waiver_ack: "entry.1193877380"
+      member_agreement_accepted: "entry.1141038060"
       referrer: "entry.366779110"
       purpose: "entry.131288088"
       am_member: "entry.1823004694"

@@ -72,7 +72,10 @@ def test_tech_update(lead_client, mocker):
     mocker.patch.object(
         tl.neon, "set_tech_custom_fields", return_value=(mocker.MagicMock(), None)
     )
-    lead_client.post("/techs/update", json={"id": "123", "interest": "stuff"})
+    rep = lead_client.post(
+        "/techs/update", json={"neon_id": "123", "interest": "stuff"}
+    )
+    assert rep.status_code == 200
     tl.neon.set_tech_custom_fields.assert_called_with("123", interest="stuff")
 
 
@@ -83,14 +86,16 @@ def test_tech_update_as_tech(tech_client, mocker):
     )
 
     # Techs cannot edit each others' fields
-    rep = tech_client.post("/techs/update", json={"id": "123", "interest": "stuff"})
+    rep = tech_client.post(
+        "/techs/update", json={"neon_id": "123", "interest": "stuff"}
+    )
     assert rep.status_code == 401
     tl.neon.set_tech_custom_fields.assert_not_called()
 
     # Note that only the interest field is allowed to change
     rep = tech_client.post(
         "/techs/update",
-        json={"id": "1234", "interest": "stuff", "area_lead": "muahaha"},
+        json={"neon_id": "1234", "interest": "stuff", "area_lead": "muahaha"},
     )
     assert rep.status_code == 200
     tl.neon.set_tech_custom_fields.assert_called_with("1234", interest="stuff")
@@ -334,7 +339,9 @@ def test_techs_backfill_events(mocker, tech_client):
             capacity=10,
             start_date=d(0),
             supply_cost=0,
+            neon_attendee_data=None,
         )
+        m.attendees = []
         m.name = name
         for k, v in ovr.items():
             setattr(m, k, v)
@@ -346,12 +353,14 @@ def test_techs_backfill_events(mocker, tech_client):
         return_value=events,
     )
     mocker.patch.object(tl, "tznow", return_value=d(-1, 10))
+    mocker.patch.object(tl, "am_lead_role", return_value=False)
 
     response = tech_client.get("/techs/events")
     assert response.status_code == 200
     assert response.json["events"] == [
         {
             "attendees": [1],
+            "attendee_details": [],
             "capacity": 10,
             "id": "123",
             "name": "Event A",
@@ -361,6 +370,7 @@ def test_techs_backfill_events(mocker, tech_client):
         },
         {
             "attendees": [],
+            "attendee_details": [],
             "capacity": 10,
             "id": "999",
             "name": "(SHOP TECH ONLY) no registants",
@@ -383,7 +393,7 @@ def test_techs_event_registration_register(mocker, tech_client):
     )
     assert rep.json == {"status": "ok"}
     tl.neon.register_for_event.assert_called_once_with(1234, 123, 456)
-    tl._notify_registration.assert_called_once_with(1234, 123, "register")
+    tl._notify_registration.assert_called_once_with(1234, 1234, 123, "register")
     tl.neon.delete_single_ticket_registration.assert_not_called()
 
 
@@ -402,7 +412,7 @@ def test_techs_event_registration_unregister(mocker, tech_client):
     assert rep.json == {"status": "ok"}
     tl.neon.register_for_event.assert_not_called()
     tl.neon.delete_single_ticket_registration.assert_called_once_with(1234, 123)
-    tl._notify_registration.assert_called_once_with(1234, 123, "unregister")
+    tl._notify_registration.assert_called_once_with(1234, 1234, 123, "unregister")
 
 
 def test_techs_area_leads(mocker, tech_client):
@@ -420,7 +430,7 @@ def test_techs_area_leads(mocker, tech_client):
     t3.name = "Tech3"
     mocker.patch.object(
         tl,
-        "_fetch_tool_areas",
+        "_tool_areas",
         return_value=mock_areas,
     )
     mocker.patch.object(tl.neon, "search_members_with_role", return_value=[t1, t2, t3])
@@ -447,7 +457,7 @@ def test_techs_area_leads_noauth(mocker, client):
     t1 = Member.from_neon_search({"First Name": "Tech", "Area Lead": "Area1"})
     mocker.patch.object(
         tl,
-        "_fetch_tool_areas",
+        "_tool_areas",
         return_value=["Area1"],
     )
     ms = mocker.patch.object(tl.neon, "search_members_with_role", return_value=[t1])
@@ -602,12 +612,36 @@ def test_techs_members(mocker, tech_client):
     m.name = "Test User"
     mocker.patch.object(tl.airtable, "get_signins_between", return_value=[m])
     mocker.patch.object(tl, "tznow", return_value=d(0, 14))
-    mocker.patch.object(tl, "safe_parse_datetime", return_value=d(1))
+
+    def safe_parse_datetime_side_effect(date_str):
+        if date_str == "2024-01-01":
+            return d(1)
+        elif date_str == "2024-01-05":
+            return d(5)
+        else:
+            return d(0)  # Default for no date specified
+
+    mocker.patch.object(
+        tl, "safe_parse_datetime", side_effect=safe_parse_datetime_side_effect
+    )
 
     rep = tech_client.get("/techs/members?start=2024-01-01")
     tl.airtable.get_signins_between.assert_called_once_with(
         d(1).replace(hour=0, minute=0, second=0),
         d(1).replace(hour=23, minute=59, second=59),
+    )
+    got = rep.json
+    assert len(got) == 1
+    assert got[0]["name"] == m.name
+
+    # Test with end date specified
+    rep = tech_client.get("/techs/members?start=2024-01-01&end=2024-01-05")
+    # Check the second call (index 1) since assert_called_once_with only checks first call
+    assert tl.airtable.get_signins_between.call_count == 2
+    call_args = tl.airtable.get_signins_between.call_args_list[1]
+    assert call_args[0] == (
+        d(1).replace(hour=0, minute=0, second=0),
+        d(5).replace(hour=23, minute=59, second=59),
     )
     got = rep.json
     assert len(got) == 1
@@ -653,7 +687,8 @@ def test_techs_tool_state(mocker, client):
     ]
 
 
-def test_techs_storage_subscriptions(mocker, lead_client):
+def test_techs_storage_subscriptions(mocker):
+    mocker.patch.object(tl, "am_lead_role", return_value=True)
     mocker.patch.object(
         tl.sales,
         "get_subscription_plan_map",
@@ -664,6 +699,7 @@ def test_techs_storage_subscriptions(mocker, lead_client):
         "get_customer_name_map",
         return_value={"TEST_CUST": ("Test Name", "a@b.com")},
     )
+    mocker.patch.object(tl.airtable, "get_storage_agreements", return_value=[])
     mocker.patch.object(
         tl.sales,
         "get_subscriptions",
@@ -710,12 +746,14 @@ def test_techs_storage_subscriptions(mocker, lead_client):
             {},
         ],
     )
-
-    response = lead_client.get("/techs/storage_subscriptions")
-    assert response.status_code == 200
-    assert response.json == [
+    ws = mocker.MagicMock()
+    tl.storage_sub_sock(ws)
+    resp = [json.loads(c.args[0]) for c in ws.send.mock_calls]
+    resp = [r for r in resp if "log_info" not in r]
+    assert resp == [
         {
             "id": "111",
+            "status": "ACTIVE",
             "charged_through_date": "2025-08-29",
             "created_at": "2025-01-29T15:18:13-05:00",
             "customer": "Test Name",
@@ -730,6 +768,7 @@ def test_techs_storage_subscriptions(mocker, lead_client):
         },
         {
             "id": "222",
+            "status": "ACTIVE",
             "charged_through_date": "2025-08-29",
             "created_at": "2025-01-29T15:18:13-05:00",
             "customer": "12345",
@@ -743,3 +782,56 @@ def test_techs_storage_subscriptions(mocker, lead_client):
             "unpaid": [],
         },
     ]
+
+
+def test_techs_door_locks(tech_client, mocker):
+    """Test door locks endpoint"""
+    mock_door_states = [
+        {
+            "name": "Front Door",
+            "mac": "00:11:22:33:44:55",
+            "is_online": True,
+            "open_close_state": False,  # Closed
+        },
+        {
+            "name": "Back Door",
+            "mac": "AA:BB:CC:DD:EE:FF",
+            "is_online": True,
+            "open_close_state": True,  # Open
+        },
+        {
+            "name": "Side Door",
+            "mac": "11:22:33:44:55:66",
+            "is_online": False,
+            "open_close_state": False,
+        },
+    ]
+
+    from datetime import datetime
+
+    from dateutil.tz import tzoffset
+
+    mock_time = datetime(2025, 1, 1, 12, 0, 0, tzinfo=tzoffset(None, -5 * 3600))
+
+    mocker.patch.object(tl.wyze, "get_door_states", return_value=mock_door_states)
+    mocker.patch.object(tl, "tznow", return_value=mock_time)
+
+    response = tech_client.get("/techs/door_locks")
+    assert response.status_code == 200
+    data = response.json
+
+    assert "doors" in data
+    assert "timestamp" in data
+    assert data["timestamp"] == "2025-01-01T12:00:00-05:00"
+    assert len(data["doors"]) == 3
+    assert data["doors"] == mock_door_states
+
+
+def test_techs_door_locks_unauthorized(client, mocker):
+    """Test door locks endpoint rejects unauthorized users"""
+    # No session setup - user is not logged in
+    response = client.get("/techs/door_locks")
+    assert response.status_code == 401  # Unauthorized
+
+    # Check that the response indicates login is required
+    assert b"login" in response.data.lower() or b"unauthorized" in response.data.lower()

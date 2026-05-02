@@ -33,12 +33,22 @@ def fixture_inst_client(client):
     return client
 
 
+@pytest.fixture(name="lead_client")
+def fixture_lead_client(client):
+    from protohaven_api.integrations.models import Role
+    from protohaven_api.testing import setup_session
+
+    setup_session(client, [Role.SHOP_TECH_LEAD])
+    return client
+
+
 def test_class_no_clearances():
     """Ensure that a class without clearances still loads the page."""
     pytest.skip("todo")
 
 
 TEST_EMAIL = "test@email.com"
+TEST_ID = "12345"
 now = datetime.datetime.now()
 
 
@@ -47,10 +57,12 @@ def test_dashboard_schedule(mocker):
 
     def _sched(_id, email=TEST_EMAIL, start=now, confirmed=None, rejected=None):
         """Create and return a fake Airtable schedule record"""
+        start = start.astimezone(tz)
         end = start + datetime.timedelta(hours=3)
         return mocker.MagicMock(
             spec=True,
             schedule_id=_id,
+            instructor_id=None,
             instructor_email=email,
             sessions=[(start, end)],
             start_time=start,
@@ -97,7 +109,10 @@ def test_dashboard_schedule(mocker):
             _sched("Bad email", confirmed=now, start=now, email="bad@bad.com"),
         ],
     )
-    got = {g.schedule_id for g in instructor.get_dashboard_schedule_sorted(TEST_EMAIL)}
+    got = {
+        g.schedule_id
+        for g in instructor.get_dashboard_schedule_sorted(TEST_ID, TEST_EMAIL)
+    }
     assert got == {"Unconfirmed, not too close", "Confirmed, after run, not too old"}
 
 
@@ -164,6 +179,11 @@ def test_class_details_both_email_and_session(mocker, inst_client):
     rbac.set_rbac(True)
     mocker.patch.object(rbac, "get_roles", return_value=[rbac.Role.INSTRUCTOR["name"]])
     mocker.patch.object(instructor, "get_dashboard_schedule_sorted")
+    mocker.patch.object(
+        instructor.neon,
+        "search_members_by_email",
+        return_value=[mocker.MagicMock(neon_id="12345")],
+    )
 
     rep = inst_client.get("/instructor/class_details?email=a@b.com")
     assert rep.status == "401 UNAUTHORIZED"
@@ -274,9 +294,7 @@ def test_instructor_class_supply_req(mocker, inst_client):
     )
 
     assert response.status_code == 200
-    instructor.airtable.get_scheduled_class.assert_called_once_with(
-        "class123", raw=False
-    )
+    instructor.airtable.get_scheduled_class.assert_called_once_with("class123")
     instructor.airtable.mark_schedule_supply_request.assert_called_once_with(
         "class123", "Supplies Requested"
     )
@@ -306,5 +324,204 @@ def test_log_quiz_submission(mocker, inst_client):
         data={"Question1": "Answer1", "Question2": "Answer2"},
         points_scored=3,
         points_to_pass=5,
+    )
+    assert response.status_code == 200
+
+
+def test_instructor_submissions(mocker, inst_client):
+    """Test the instructor submissions handler"""
+    # Mock the sheets module
+    mock_sheets = mocker.patch.object(instructor, "sheets")
+
+    # Create mock submissions data
+    now = datetime.datetime.now()
+    mock_submissions = [
+        {
+            "Timestamp": now,
+            "Email Address": "foo@bar.com",
+            "Neon Event ID (please ignore)": "EVENT123",
+            "Class Name": "Woodworking 101",
+            "Students Passed": "3",
+        },
+        {
+            "Timestamp": now + datetime.timedelta(hours=1),
+            "Email Address": "foo@bar.com",
+            "Neon Event ID (please ignore)": "EVENT456",
+            "Class Name": "Metalworking 101",
+            "Students Passed": "5",
+        },
+        {
+            "Timestamp": now + datetime.timedelta(hours=2),
+            "Email Address": "foo@bar.com",
+            "Neon Event ID (please ignore)": "EVENT123",  # Same event, different submission
+            "Class Name": "Woodworking 101 - Advanced",
+            "Students Passed": "2",
+        },
+        {
+            "Timestamp": now + datetime.timedelta(hours=3),
+            "Email Address": "other@bar.com",  # Different instructor
+            "Neon Event ID (please ignore)": "EVENT789",
+            "Class Name": "Ceramics 101",
+            "Students Passed": "2",
+        },
+        {
+            "Timestamp": now + datetime.timedelta(hours=4),
+            "Email Address": "foo@bar.com",
+            # Missing Neon Event ID
+            "Class Name": "3D Printing 101",
+            "Students Passed": "4",
+        },
+    ]
+
+    # Set up the mock to return our test data
+    mock_sheets.get_instructor_submissions_raw.return_value = mock_submissions
+
+    # Test with logged-in user (foo@bar.com)
+    response = inst_client.get("/instructor/submissions")
+    assert response.status_code == 200
+
+    # Parse the response
+    data = json.loads(response.data)
+
+    # Should have 2 event IDs for foo@bar.com
+    assert len(data) == 2
+
+    # Check that EVENT123 and EVENT456 are in the results
+    assert "EVENT123" in data
+    assert "EVENT456" in data
+
+    # Verify the data structure - each event ID should have a list of timestamps
+    assert isinstance(data["EVENT123"], list)
+    assert len(data["EVENT123"]) == 2  # Two submissions for EVENT123
+    # Check that we have timestamps (they will be serialized as strings by Flask)
+    assert isinstance(data["EVENT123"][0], str)
+    assert isinstance(data["EVENT123"][1], str)
+
+    assert isinstance(data["EVENT456"], list)
+    assert len(data["EVENT456"]) == 1
+    assert isinstance(data["EVENT456"][0], str)
+
+    # Test with email parameter (same as logged-in user)
+    response = inst_client.get("/instructor/submissions?email=foo@bar.com")
+    assert response.status_code == 200
+
+    # Test with email parameter (different user - should fail without admin role)
+    response = inst_client.get("/instructor/submissions?email=other@bar.com")
+    assert response.status_code == 401
+
+    # Test with admin role accessing other user's submissions
+    mocker.patch.object(rbac, "get_roles", return_value=[rbac.Role.ADMIN["name"]])
+    response = inst_client.get("/instructor/submissions?email=other@bar.com")
+    assert response.status_code == 200
+    data = json.loads(response.data)
+    # Should have 1 event ID for other@bar.com
+    assert len(data) == 1
+    assert "EVENT789" in data
+    assert isinstance(data["EVENT789"], list)
+    assert len(data["EVENT789"]) == 1
+    assert isinstance(data["EVENT789"][0], str)
+
+
+def test_instructor_list(mocker, lead_client):
+    """Test instructor list endpoint"""
+    from protohaven_api.integrations.models import Member
+
+    m = Member.from_neon_search(
+        {
+            "Email 1": "instructor@test.com",
+            "First Name": "Test",
+            "Last Name": "Instructor",
+            "Account ID": 456,
+        }
+    )
+    mocker.patch.object(instructor.neon, "search_members_with_role", return_value=[m])
+    mocker.patch.object(
+        instructor.airtable,
+        "get_all_instructor_capabilities_formatted",
+        return_value=[],
+    )
+    # Mock get_all_class_templates for class templates
+    mocker.patch.object(instructor.airtable, "get_all_class_templates", return_value=[])
+
+    response = lead_client.get("/instructor/list")
+    assert response.status_code == 200
+    assert response.json == {
+        "capabilities": [],
+        "classes": [],
+        "enrollment_map": {"456": "Test Instructor"},
+    }
+
+
+def test_instructor_enroll(inst_client, mocker):
+    """Test instructor enrollment endpoint"""
+    # Mock the patch_member_role function
+    mock_response = (mocker.MagicMock(), None)
+    mocker.patch.object(
+        instructor.neon, "patch_member_role", return_value=mock_response
+    )
+
+    # Test enrollment - should fail because inst_client doesn't have education lead role
+    response = inst_client.post(
+        "/instructor/enroll", json={"neon_id": "123", "enroll": True}
+    )
+
+    # Should return 401 or redirect since user doesn't have education lead role
+    assert response.status_code in [401, 302]
+
+
+def test_instructor_enroll_with_education_lead(client, mocker):
+    """Test instructor enrollment endpoint with education lead role"""
+    from protohaven_api.integrations.models import Role
+    from protohaven_api.testing import setup_session
+
+    # Setup session with education lead role
+    setup_session(client, [Role.EDUCATION_LEAD])
+
+    # Mock the patch_member_role function
+    mock_response = (mocker.MagicMock(), None)
+    mocker.patch.object(
+        instructor.neon, "patch_member_role", return_value=mock_response
+    )
+
+    # Test enrollment
+    response = client.post(
+        "/instructor/enroll", json={"neon_id": "123", "enroll": True}
+    )
+
+    instructor.neon.patch_member_role.assert_called_with(
+        "123", instructor.Role.INSTRUCTOR, True
+    )
+    assert response.status_code == 200
+
+
+def test_instructor_enroll_create_account(client, mocker):
+    """Test instructor enrollment with account creation"""
+    from protohaven_api.integrations.models import Role
+    from protohaven_api.testing import setup_session
+
+    # Setup session with education lead role
+    setup_session(client, [Role.EDUCATION_LEAD])
+
+    # Mock functions
+    mocker.patch.object(instructor.neon, "create_member", return_value="789")
+    mock_response = (mocker.MagicMock(), None)
+    mocker.patch.object(
+        instructor.neon, "patch_member_role", return_value=mock_response
+    )
+
+    # Test enrollment with account creation
+    response = client.post(
+        "/instructor/enroll",
+        json={
+            "name": "New Instructor",
+            "email": "new@test.com",
+            "enroll": True,
+            "create_account": True,
+        },
+    )
+
+    instructor.neon.create_member.assert_called_with("New Instructor", "new@test.com")
+    instructor.neon.patch_member_role.assert_called_with(
+        "789", instructor.Role.INSTRUCTOR, True
     )
     assert response.status_code == 200

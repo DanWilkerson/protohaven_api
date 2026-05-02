@@ -9,7 +9,7 @@ import {
 import { get, post } from '$lib/api.ts';
 import type { Tech, DisplayTech, SearchResult, ToastMessage, SortType, TechListData } from './types';
 import FetchError from '../fetch_error.svelte';
-import TechCard from './TechCard.svelte';
+import TechCard from './tech_card.svelte';
 
 // Utility functions
 function debounce<T extends (...args: any[]) => any>(
@@ -57,7 +57,7 @@ let enrolling = false;
 let techs: DisplayTech[] = [];
 let techs_sorted: DisplayTech[] = [];
 let user_data: DisplayTech | null = null;
-let sort_type: SortType = "clearances_desc";
+let sort_type: SortType = "name";
 
 // Reactive sort
 $: {
@@ -405,15 +405,6 @@ function clearance_click(id: string) {
               {:else}
                 Enroll
               {/if}
-            </Button>
-            <Button
-              class="mx-1"
-              size="sm"
-              on:click={() => set_enrollment(false)}
-              disabled={enrolling || (new_tech.neon_id && !is_enrolled(new_tech.neon_id)) || !new_tech.neon_id}
-              aria-label="Disenroll selected account"
-            >
-              Disenroll
             </Button>
           {/if}
         </div>

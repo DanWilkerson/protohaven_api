@@ -1,18 +1,28 @@
 """Site for tech leads to manage shop techs"""
 
 import datetime
+import json
 import logging
 import re
 from collections import defaultdict
-from concurrent.futures import ThreadPoolExecutor
+from concurrent import futures
 from functools import lru_cache
 
 from flask import Blueprint, Response, current_app, redirect, request, session
+from flask_sock import Sock
 
 from protohaven_api.automation.classes import events as eauto
 from protohaven_api.automation.techs import techs as tauto
 from protohaven_api.config import get_config, safe_parse_datetime, tz, tznow
-from protohaven_api.integrations import airtable, comms, neon, neon_base, sales, wiki
+from protohaven_api.integrations import (
+    airtable,
+    comms,
+    neon,
+    neon_base,
+    sales,
+    wiki,
+    wyze,
+)
 from protohaven_api.integrations.models import Role
 from protohaven_api.rbac import am_lead_role, am_neon_id, am_role, require_login_role
 
@@ -63,15 +73,6 @@ EXCLUDED_AREAS = [
 ]
 
 
-@lru_cache(maxsize=1)
-def _fetch_tool_areas():
-    return {
-        a["fields"]["Name"].strip()
-        for a in airtable.get_areas()
-        if a["fields"]["Name"] not in EXCLUDED_AREAS
-    }
-
-
 def _fetch_tool_states(now):
     tool_states = []
     now = now.astimezone(tz)
@@ -116,14 +117,26 @@ def techs_docs_state():
 
 
 @page.route("/techs/members")
-@require_login_role(Role.SHOP_TECH, redirect_to_login=False)
+@require_login_role(
+    Role.SHOP_TECH_LEAD,
+    Role.EDUCATION_LEAD,
+    Role.STAFF,
+    Role.SHOP_TECH,
+    redirect_to_login=False,
+)
 def techs_members():
-    """Fetches today's sign-in information for members"""
+    """Fetches sign-in information for members within a date range"""
     start = request.values.get("start")
     start = (safe_parse_datetime(start) if start else tznow()).replace(
         hour=0, minute=0, second=0, tzinfo=tz
     )
-    end = start.replace(hour=23, minute=59, second=59)
+
+    end = request.values.get("end")
+    if end:
+        end = safe_parse_datetime(end).replace(hour=23, minute=59, second=59, tzinfo=tz)
+    else:
+        end = start.replace(hour=23, minute=59, second=59)
+
     log.info(f"Fetching signins from {start} to {end}")
     return [
         {
@@ -142,10 +155,19 @@ def techs_members():
     ]
 
 
+@lru_cache(maxsize=1)
+def _tool_areas():
+    return {
+        a["fields"]["Name"].strip()
+        for a in airtable.get_areas()
+        if a["fields"]["Name"] not in EXCLUDED_AREAS
+    }
+
+
 @page.route("/techs/area_leads")
 def techs_area_leads():
     """Fetches the mapping of areas to area leads"""
-    areas = _fetch_tool_areas()
+    areas = _tool_areas()
     area_map = {a: [] for a in areas}
     extras_map = defaultdict(list)
 
@@ -218,13 +240,19 @@ def _notify_override(name, shift, techs):
 
 
 @page.route("/techs/forecast/override", methods=["POST", "DELETE"])
-@require_login_role(Role.SHOP_TECH, redirect_to_login=False)
+@require_login_role(
+    Role.SHOP_TECH_LEAD,
+    Role.EDUCATION_LEAD,
+    Role.STAFF,
+    Role.SHOP_TECH,
+    redirect_to_login=False,
+)
 def techs_forecast_override():
     """Update/remove forecast overrides on shop tech forecast"""
     # We want to know who's modifying the schedule, not just the generic shop tech user
     if am_neon_id(get_config("general/shop_tech_neon_id")):
         return Response(
-            "Generic shop tech user is not allowed to modify the shift schedule."
+            "Generic shop tech user is not allowed to modify the shift schedule. "
             "Please log in as a specific tech to change the schedule.",
             status=400,
         )
@@ -320,22 +348,23 @@ def techs_list():
 def tech_update():
     """Update the custom fields of a shop tech in Neon"""
     data = request.json
-    nid = data["id"]
+    nid = data["neon_id"]
 
-    editable_fields = (
-        "shop_tech_shift",
-        "area_lead",
-        "interest",
-        "expertise",
-        "shop_tech_first_day",
-        "shop_tech_last_day",
-    )
-    if not am_lead_role():
-        if not am_neon_id(nid):
+    if am_lead_role():
+        editable_fields = (
+            "shop_tech_shift",
+            "area_lead",
+            "interest",
+            "expertise",
+            "shop_tech_first_day",
+            "shop_tech_last_day",
+        )
+    else:
+        if am_neon_id(nid):
+            # Techs editing their own data can only edit a subset of fields
+            editable_fields = ("interest", "expertise")
+        else:
             return Response("Access Denied", status=401)
-
-        # Techs editing their own data can only edit a subset of fields
-        editable_fields = ("interest", "expertise")
 
     body = {k: v for k, v in data.items() if k in editable_fields}
     return neon.set_tech_custom_fields(nid, **body)
@@ -413,21 +442,14 @@ def techs_enroll():
     if data.get("create_account", False):
         name = data.get("name", "")
         email = data.get("email", "")
-
-        if not name or not email:
-            return {
-                "error": "Name and email are required when creating a new account"
-            }, 400
-
         try:
             nid = neon.create_member(name, email)
-            return neon.patch_member_role(nid, Role.SHOP_TECH, data["enroll"])
         except (RuntimeError, KeyError, ValueError) as e:
             log.error(f"Failed to create and enroll member {name} ({email}): {e}")
             return {"error": f"Failed to create account: {str(e)}"}, 500
-
-    # Existing account enrollment/disenrollment
-    return neon.patch_member_role(data["neon_id"], Role.SHOP_TECH, data["enroll"])
+    else:
+        nid = data["neon_id"]
+    return neon.patch_member_role(nid, Role.SHOP_TECH, data["enroll"])
 
 
 @page.route("/techs/events")
@@ -437,6 +459,7 @@ def techs_backfill_events():
     """
     for_techs = []
     now = tznow()
+    is_admin = am_lead_role()
 
     def _keep(evt):
         if evt.in_blocklist():
@@ -455,7 +478,7 @@ def techs_backfill_events():
 
     # Should dedupe logic with builder.py eventually.
     # We look for unpublished events too since those may be tech events
-    for evt in eauto.fetch_upcoming_events(
+    for evt in eauto.fetch_upcoming_events(  # pylint: disable=too-many-nested-blocks
         published=False, merge_airtable=True, attendees=_keep, tickets=_keep
     ):
         if not _keep(evt):
@@ -464,12 +487,35 @@ def techs_backfill_events():
         # attendee_count requires attendee data to have been fetched,
         # so we have to additionally check here
         if evt.name.startswith(TECH_ONLY_PREFIX) or evt.attendee_count > 0:
+            # Get attendee details for admins
+            attendee_details = []
+            if is_admin and evt.neon_attendee_data is not None:
+                for attendee in evt.attendees:
+                    if attendee.valid:
+                        attendee_info = {
+                            "neon_id": attendee.neon_id,
+                            "name": attendee.name,
+                            "email": attendee.email,
+                            "is_volunteer": False,
+                        }
+                        # Try to get phone number from member account
+                        if attendee.neon_id:
+                            try:
+                                member = neon_base.fetch_account(attendee.neon_id)
+                                if member and hasattr(member, "phone") and member.phone:
+                                    attendee_info["phone"] = member.phone
+                                attendee_info["is_volunteer"] = member.is_volunteer()
+                            except RuntimeError:
+                                pass  # Silently fail if we can't fetch member data
+                        attendee_details.append(attendee_info)
+
             for_techs.append(
                 {
                     "id": evt.neon_id,
                     "ticket_id": evt.single_registration_ticket_id,
                     "name": evt.name,
                     "attendees": list(evt.signups),
+                    "attendee_details": attendee_details if is_admin else [],
                     "capacity": evt.capacity,
                     "start": evt.start_date.isoformat(),
                     "supply_cost": evt.supply_cost or 0,
@@ -482,19 +528,25 @@ def techs_backfill_events():
         "can_edit": am_lead_role()
         or am_role(Role.EDUCATION_LEAD)
         or am_role(Role.STAFF),
+        "is_admin": is_admin,
     }
 
 
-def _notify_registration(account_id, event_id, action):
+def _notify_registration(account_id, attendee_neon_id, event_id, action):
     """Sends notification of state of class to the techs and instructors channels
     when a tech (un)registers to backfill a class."""
     acc = neon_base.fetch_account(account_id, required=True)
+    target = (
+        acc
+        if account_id == attendee_neon_id
+        else neon_base.fetch_account(attendee_neon_id, required=True)
+    )
     evt = eauto.fetch_event(event_id, attendees=True)
-    verb = "registered for"
+    verb = "registered"
     if action != "register":
-        verb = "unregistered from"
+        verb = "unregistered"
     msg = (
-        f"{acc.name} {verb} via [/techs](https://api.protohaven.org/techs#events) "
+        f"{acc.name} {verb} {target.name} via [/techs](https://api.protohaven.org/techs#events): "
         f"{evt.name} on {evt.start_date.strftime('%a %b %d %-I:%M %p')} "
         f"; {evt.capacity - evt.attendee_count} seat(s) remain"
     )
@@ -505,13 +557,19 @@ def _notify_registration(account_id, event_id, action):
 
 
 @page.route("/techs/event", methods=["POST"])
-@require_login_role(Role.SHOP_TECH, redirect_to_login=False)
-def techs_event_registration():
-    """Register a shop tech for an event, via Neon ID"""
+@require_login_role(
+    Role.SHOP_TECH_LEAD,
+    Role.STAFF,
+    Role.EDUCATION_LEAD,
+    Role.SHOP_TECH,
+    redirect_to_login=False,
+)
+def techs_event_registration():  # pylint: disable=too-many-return-statements
+    """Register/unregister a shop tech for an event, or admin de-register any attendee"""
     # We want to know who's modifying the schedule, not just the generic shop tech user
     if am_neon_id(get_config("general/shop_tech_neon_id")):
         return Response(
-            "Generic shop tech user is not allowed to register for events."
+            "Generic shop tech user is not allowed to register for events. "
             "Please log in as a specific tech, then retry.",
             status=400,
         )
@@ -521,58 +579,135 @@ def techs_event_registration():
     event_id = data.get("event_id")
     ticket_id = data.get("ticket_id")
     action = data.get("action")
+    attendee_neon_id_raw = data.get("attendee_neon_id")
+    attendee_neon_id = (
+        str(attendee_neon_id_raw).strip()
+        if attendee_neon_id_raw is not None
+        else account_id
+    )
+
     log.info(f"Attempt to (un)register for event: {account_id} {data}")
     if not account_id:
         return Response("Not logged in", status=401)
     if not event_id:
         return Response("event_id required", status=400)
-    if not action in ("register", "unregister"):
-        return Response("action must be one of 'register', 'unregister'", status=400)
 
-    if action == "register":
-        ret = neon.register_for_event(account_id, event_id, ticket_id)
+    # Handle regular register/unregister actions
+    if action in ("register", "unregister"):
+        # Note: free classes have no ticket ID
+        # if not ticket_id and action == "register":
+        #    return Response("ticket_id required for register action", status=400)
+
+        if attendee_neon_id != account_id and not am_lead_role():
+            return Response(
+                "Admin privileges required for admin unregister action", status=403
+            )
+
+        if action == "register":
+            ret = neon.register_for_event(attendee_neon_id, event_id, ticket_id)
+        else:
+            ret = neon.delete_single_ticket_registration(
+                attendee_neon_id, event_id
+            ) or {"status": "ok"}
+        if ret:
+            _notify_registration(account_id, attendee_neon_id, event_id, action)
+            return ret
     else:
-        ret = neon.delete_single_ticket_registration(account_id, event_id) or {
-            "status": "ok"
-        }
-    if ret:
-        _notify_registration(account_id, event_id, action)
-        return ret
+        return Response(
+            "action must be one of 'register', 'unregister'",
+            status=400,
+        )
+
     raise RuntimeError("Unknown error handling event registration state")
 
 
-@page.route("/techs/storage_subscriptions", methods=["GET"])
-@require_login_role(
-    Role.SHOP_TECH_LEAD, Role.STAFF, Role.SHOP_TECH, redirect_to_login=False
-)
-def techs_storage_subscriptions():
+def setup_sock_routes(app):
+    """Set up all websocket routes; called by main.py"""
+    sock = Sock(app)
+    sock.route("/techs/storage_subscriptions")(storage_sub_sock)
+
+
+def storage_sub_sock(ws):  # pylint: disable=too-many-locals
     """Fetch tabular data about storage subscriptions in Square
 
     This offers a more "storage forward" interface vs Square, which is only
     sorted by customer name and shows a bunch of cancelled stuff too.
     """
 
-    log.info("Async fetching subscription data")
-    futures = []
-    with ThreadPoolExecutor() as executor:
-        futures.append(executor.submit(sales.get_subscription_plan_map))
+    if not (am_lead_role() or am_role(Role.SHOP_TECH)):
+        ws.send(json.dumps({"error": "permission denied"}))
+        ws.close()
+        return
+
+    def _ws_log(s):
+        log.info(s)
+        ws.send(json.dumps({"log_info": s}))
+
+    _ws_log("Async fetching subscription data")
+    all_fetches = []
+    with futures.ThreadPoolExecutor() as executor:
+        all_fetches.append(executor.submit(sales.get_subscription_plan_map))
         # We need the email despite PII limitations in order to lookup membership info
-        futures.append(
+        all_fetches.append(
             executor.submit(
                 sales.get_customer_name_map, include_pii=True, include_email=True
             )
         )
-        futures.append(executor.submit(sales.get_unpaid_invoices_by_id))
+        all_fetches.append(executor.submit(sales.get_unpaid_invoices_by_id))
+        all_fetches.append(executor.submit(airtable.get_storage_agreements))
 
-    sub_plan_map, cust_map, unpaid_invoices = [f.result() for f in futures]
+    not_done = all_fetches
+    while True:
+        _, not_done = futures.wait(not_done)
+        if len(not_done) <= 0:
+            break
+        _ws_log(f"Awaiting {len(not_done)} data fetches")
+
+    sub_plan_map, cust_map, unpaid_invoices, storage_agreements = [
+        f.result() for f in all_fetches
+    ]
+    storage_agreements = list(storage_agreements)
     unpaid_invoices = dict(unpaid_invoices)
+    _ws_log("Data fetches complete, parsing")
     log.info(f"Fetched map of {len(sub_plan_map)} subscriptions")
     log.info(f"Fetched {len(cust_map)} customers")
     log.info(f"Fetched {len(unpaid_invoices)} unpaid invoices")
-    result = []
+    log.info(f"Fetched {len(storage_agreements)} storage agreements")
+    for a in storage_agreements:
+        ws.send(
+            json.dumps(
+                {
+                    "id": a["id"],
+                    "status": "ACTIVE",
+                    "created_at": a["Start Date"].isoformat(),
+                    "start_date": a["Start Date"].strftime("%Y-%m-%d"),
+                    "charged_through_date": a["End Date"].strftime("%Y-%m-%d"),
+                    "monthly_billing_anchor_date": "unknown",
+                    "customer": a.get("Name") or "N/A",
+                    "email": (
+                        a.get("Email") if am_lead_role() else None
+                    ),  # Only tech leads / admins
+                    "plan": "Non-Square Agreement",
+                    "price": 0,
+                    "membership_status": "N/A",
+                    "note": json.dumps(
+                        {
+                            "storage_id": a.get("Storage ID"),
+                            "storage_type": a.get("Type"),
+                            "storage_detail": a.get("Details"),
+                        }
+                    ),
+                    "unpaid": [],
+                }
+            )
+        )
     log.info("Fetching and looping through subscriptions")
     for sub in sales.get_subscriptions():
-        if sub["status"] != "ACTIVE":
+        unpaid = [i for i in sub["invoice_ids"] if i in unpaid_invoices]
+
+        # Include not only active subscriptions, but cancelled subs
+        # that haven't been fully paid out.
+        if sub["status"].upper() != "ACTIVE" and not (unpaid and am_lead_role()):
             continue
 
         plan, price = sub_plan_map.get(
@@ -596,34 +731,42 @@ def techs_storage_subscriptions():
                 status = check_status
                 break
 
-        result.append(
-            {
-                "id": sub["id"],
-                "created_at": sub["created_at"],
-                "start_date": sub["start_date"],
-                "charged_through_date": sub["charged_through_date"],
-                "monthly_billing_anchor_date": sub.get("monthly_billing_anchor_date")
-                or "unknown",
-                "customer": cust_name,
-                "email": (
-                    cust_email if am_lead_role() else None
-                ),  # Only tech leads / admins
-                "plan": plan,
-                "price": price,
-                "membership_status": status,
-                "note": sub.get("note") or "",
-                "unpaid": (
-                    [i for i in sub["invoice_ids"] if i in unpaid_invoices]
-                    if am_lead_role()
-                    else []
-                ),
-            }
+        ws.send(
+            json.dumps(
+                {
+                    "id": sub["id"],
+                    "status": sub["status"],
+                    "created_at": sub["created_at"],
+                    "start_date": sub["start_date"],
+                    "charged_through_date": sub["charged_through_date"],
+                    "monthly_billing_anchor_date": sub.get(
+                        "monthly_billing_anchor_date"
+                    )
+                    or "unknown",
+                    "customer": cust_name,
+                    "email": (
+                        cust_email if am_lead_role() else None
+                    ),  # Only tech leads / admins
+                    "plan": plan,
+                    "price": price,
+                    "membership_status": status,
+                    "note": sub.get("note") or "",
+                    "unpaid": (unpaid if am_lead_role() else []),
+                }
+            )
         )
-    return result
+    _ws_log("Done")
+    ws.close()
 
 
 @page.route("/techs/storage_subscriptions/<sub_id>/note", methods=["POST"])
-@require_login_role(Role.SHOP_TECH, redirect_to_login=False)
+@require_login_role(
+    Role.SHOP_TECH_LEAD,
+    Role.STAFF,
+    Role.EDUCATION_LEAD,
+    Role.SHOP_TECH,
+    redirect_to_login=False,
+)
 def set_sub_note(sub_id):
     """Sets the note on a square subscription"""
     data = request.json
@@ -632,3 +775,165 @@ def set_sub_note(sub_id):
         return Response("note and subscription ID reqiured", 400)
     log.info(f"Setting storage subscription {sub_id} note to {note}")
     return sales.set_subscription_note(sub_id, note)
+
+
+@page.route("/techs/door_locks")
+@require_login_role(
+    Role.SHOP_TECH_LEAD,
+    Role.EDUCATION_LEAD,
+    Role.STAFF,
+    Role.SHOP_TECH,
+    Role.BOARD_MEMBER,
+    redirect_to_login=False,
+)
+def techs_door_locks():
+    """Fetches the current state of all door locks"""
+    door_states = list(wyze.get_door_states())
+    # Add timestamp for when the data was fetched
+    return {
+        "doors": door_states,
+        "timestamp": tznow().isoformat(),
+    }
+
+
+@page.route("/techs/attendance_report", methods=["POST"])
+@require_login_role(
+    Role.SHOP_TECH_LEAD, Role.STAFF, Role.EDUCATION_LEAD, redirect_to_login=False
+)
+def run_attendance_report():  # pylint: disable=too-many-locals, too-many-statements
+    """Runs a simple attendance report. Counts on-time shifts, callouts, and no-shows"""
+    data = request.json
+    start = safe_parse_datetime(data["start_date"])
+    end = safe_parse_datetime(data["end_date"])
+    log.info(f"Fetching attendance report from {start} to {end}")
+
+    numdays = (end - start).days + 1  # fencepost error fix
+    print(f"Running from {start} to {end} ({numdays} days)")
+
+    def analyze(date, shift, callout, sign_ins):
+        day_end = date + datetime.timedelta(hours=24)
+        shift_start = date.replace(hour=10 if shift == "AM" else 16, minute=0, second=0)
+        shift_late = shift_start + datetime.timedelta(minutes=10)
+        outcome = {
+            "On Time": False,
+            "Late": False,
+            "Absent": False,
+            "Callout": callout,
+            "Earliest": None,
+        }
+
+        if callout:
+            return outcome
+
+        # On time if the sign in for the day is earlier than the start of shift
+        # Late if the sign in time for the day is 10min after the start of the shift
+        # Absent if zero sign ins for the day
+        # Callout if original shift includes them, but override does not
+
+        # Precondition: sign in data is in ascending date order
+        for evt in sign_ins:
+            if evt < date:
+                continue
+            if evt > day_end:
+                break
+            if not outcome["Earliest"]:
+                outcome["Earliest"] = evt
+            if evt < shift_late:
+                outcome["On Time"] = True
+                return outcome
+            if evt >= shift_late:
+                outcome["Late"] = True
+                return outcome
+
+        outcome["Absent"] = True
+        return outcome
+
+    def fetch_tech_email_map():
+        tech_email_map = defaultdict(list)
+        for t in neon.search_members_with_role(
+            Role.SHOP_TECH,
+            fields=["Email 1", "Email 2", "Email 3", "First Name", "Last Name"],
+        ):
+            name = f"{t.legal_fname} {t.lname}".lower()
+            for e in ["Email 1", "Email 2", "Email 3"]:
+                if t.neon_search_data.get(e):
+                    tech_email_map[name].append(t.neon_search_data[e])
+        return tech_email_map
+
+    def get_signins_by_email():
+        sign_ins_by_email = defaultdict(list)
+        for rec in airtable.get_signins_between(start, end):
+            sign_ins_by_email[rec.email.lower().strip()].append(rec.created)
+        sign_ins_by_email = {k: sorted(v) for k, v in sign_ins_by_email.items()}
+        return sign_ins_by_email
+
+    log.info("Generating shift schedule")
+    shifts = tauto.generate(start, numdays, True)["calendar_view"]
+    log.info("Shift schedule generated")
+
+    sign_ins_by_email = get_signins_by_email()
+    log.info("Sign ins collected")
+
+    tech_email_map = fetch_tech_email_map()
+    log.info("Tech emails fetched")
+    log.info(str(list(tech_email_map.keys())))
+
+    result = []
+    for day_data in shifts:
+        log.info(f"Processing {day_data['date']}")
+        date = safe_parse_datetime(day_data["date"])
+        for ap in ("AM", "PM"):
+            orig = {
+                f"{p.legal_fname} {p.lname}".lower()
+                for p in day_data[ap].get("ovr", {}).get("orig", [])
+            }
+            people = {
+                f"{p.legal_fname} {p.lname}".lower() for p in day_data[ap]["people"]
+            }
+            for person in people.union(orig):
+                emails = tech_email_map.get(person) or []
+                if not emails or len(emails) == 0:
+                    log.error(f"No email for {person}; continuing with error")
+                    emails.append("ERR_NO_EMAIL")
+                signins = []
+                for e in emails:
+                    signins += sign_ins_by_email.get(e.strip().lower(), [])
+
+                outcome = analyze(
+                    date, ap, person in orig and person not in people, signins
+                )
+
+                earliest = (
+                    (outcome["Earliest"].astimezone(tz).strftime("%Y-%m-%d %-I:%M %p"))
+                    if outcome.get("Earliest")
+                    else ""
+                )
+
+                result.append(
+                    (
+                        date.strftime("%Y-%m-%d"),
+                        ap,
+                        person,
+                        ";".join(emails),
+                        earliest,
+                        outcome["On Time"],
+                        outcome["Late"],
+                        outcome["Absent"],
+                        outcome["Callout"],
+                    )
+                )
+    log.info("Done!")
+    return {
+        "header": [
+            "Date",
+            "Shift",
+            "Name",
+            "Email",
+            "Earliest Sign In",
+            "On Time",
+            "Late",
+            "Absent",
+            "Callout",
+        ],
+        "rows": result,
+    }

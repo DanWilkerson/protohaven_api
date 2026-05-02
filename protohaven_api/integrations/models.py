@@ -23,7 +23,13 @@ class NoAttendeeDataError(RuntimeError):
     """Raised when no attendee data is provided for an event to compute derived properties"""
 
 
+Email = str
+EventID = str  # Neon or Eventbrite event ID
 NeonID = str
+AreaID = str
+ToolCode = str  # e.g. "FRG1". Comes from Tools & Equipment table
+ClearanceCodeShort = str  # e.g. "FRG". Prefix of ClearanceCodeFull
+ClearanceCodeFull = str  # e.g. "FRG: Forge". Comes from Clearances table
 
 
 @dataclass
@@ -342,12 +348,31 @@ class Member:  # pylint:disable=too-many-public-methods
             self._raw_account().get("primaryContact", {}).get("email2"),
             self._raw_account().get("primaryContact", {}).get("email3"),
         ]
-        return [e.strip().lower() for e in raw if e is not None]
+        return [e.strip().lower() for e in raw if e is not None and e.strip()]
 
     @property
     def email(self) -> str:
         """Fetches the first valid email address for the member"""
         return self.emails[0] if self.emails else None
+
+    @property
+    def phones(self) -> list[str]:
+        """Get all the phone numbers for this user in preferential order, omitting empty
+        results."""
+        raw = [
+            self.neon_search_data.get("Phone 1"),
+            self.neon_search_data.get("Phone 2"),
+            self.neon_search_data.get("Phone 3"),
+            self._raw_account().get("primaryContact", {}).get("phone1"),
+            self._raw_account().get("primaryContact", {}).get("phone2"),
+            self._raw_account().get("primaryContact", {}).get("phone3"),
+        ]
+        return [p.strip() for p in raw if p is not None and p.strip()]
+
+    @property
+    def phone(self) -> str:
+        """Fetches the first valid phone number for the member"""
+        return self.phones[0] if self.phones else None
 
     def _get_custom_field(self, key_field, value_field):
         search_result = self.neon_search_data.get(key_field)
@@ -451,6 +476,17 @@ class Member:  # pylint:disable=too-many-public-methods
         return (None, None)
 
     @property
+    def member_agreement_accepted(self) -> tuple[str | None, datetime.datetime | None]:
+        """Return version and date of member agreement acceptance via custom neon field"""
+        v = self._get_custom_field("Member Agreement Accepted", "value") or ""
+        match = re.match(WAIVER_REGEX, v)
+        if match is not None:
+            last_version = match[1]
+            last_signed = safe_parse_datetime(match[2])
+            return (last_version, last_signed)
+        return (None, None)
+
+    @property
     def notify_board_and_staff(self) -> str:
         """Return Notify Board & Staff custom neon field"""
         return self._get_custom_field("Notify Board & Staff", "value") or ""
@@ -461,7 +497,7 @@ class Member:  # pylint:disable=too-many-public-methods
         return self._raw_account().get("company", None)
 
     @property
-    def clearances(self):
+    def clearances(self) -> list[ClearanceCodeFull]:
         """Fetches clearances for the account"""
         if self.neon_search_data and self.neon_search_data.get("Clearances"):
             return [v.strip() for v in self.neon_search_data["Clearances"].split("|")]
@@ -485,6 +521,23 @@ class Member:  # pylint:disable=too-many-public-methods
 
         return None
 
+    def is_volunteer(self) -> bool:
+        """Returns true if the member is a volunteer role, false otherwise"""
+        for r in self.roles or []:
+            if r in (
+                Role.INSTRUCTOR,
+                Role.BOARD_MEMBER,
+                Role.SHOP_TECH,
+                Role.SHOP_TECH_LEAD,
+                Role.EDUCATION_LEAD,
+                Role.SOFTWARE_DEV,
+                Role.IT_MAINTENANCE,
+                Role.DEVOPS,
+                Role.MAINTENANCE_CREW,
+            ):
+                return True
+        return False
+
     @property
     def volunteer_bio(self):
         """With bio data, get member bio string"""
@@ -497,9 +550,10 @@ class Member:  # pylint:disable=too-many-public-methods
         """With bio data, get member's profile picture"""
         if not self.airtable_bio_data:
             return None
-        thumbs = self.airtable_bio_data["fields"].get("Picture")[0]["thumbnails"][
-            "large"
-        ]
+        pic = self.airtable_bio_data["fields"].get("Picture")
+        if not pic:
+            return None
+        thumbs = pic[0]["thumbnails"]["large"]
         return thumbs.get("url") or urljoin(
             "http://localhost:8080",
             thumbs.get("signedPath"),
@@ -913,6 +967,67 @@ class Event:  # pylint: disable=too-many-public-methods
         return None
 
     @property
+    def areas(self) -> list[str]:
+        """Returns the list of areas for this event from Airtable data"""
+        if self.airtable_data:
+            s = self.airtable_data.get("fields", {}).get(
+                "Name (from Area) (from Class)"
+            )
+            return s
+        return []
+
+    @property
+    def sessions(self) -> list[tuple[datetime.datetime, datetime.datetime]]:
+        """Returns the list of sessions for this event from Airtable data"""
+        if not self.airtable_data:
+            return []
+
+        fields = self.airtable_data.get("fields", {})
+        sessions_str = fields.get("Sessions")
+        if not sessions_str:
+            return []
+
+        # Parse session start times
+        session_starts = []
+        for session_time in sessions_str.split(","):
+            try:
+                session_dt = datetime.datetime.fromisoformat(session_time.strip())
+                session_starts.append(session_dt)
+            except (ValueError, AttributeError):
+                continue
+
+        if not session_starts:
+            return []
+
+        # Get hours from Airtable data
+        hours_str = fields.get("Hours (from Class)")
+        days_str = fields.get("Days (from Class)")
+
+        # Use the same logic as Class.resolve_hours
+        hours = []
+        try:
+            if not days_str:
+                hours = [float(s) for s in str(hours_str).split(",") or []]
+            else:
+                hours = [float(hours_str)] * int(days_str)
+        except (ValueError, TypeError):
+            # If we can't parse hours, default to 3 hours per session
+            hours = [3.0] * len(session_starts)
+
+        # Ensure we have enough hours for all sessions
+        if len(hours) < len(session_starts):
+            hours += [hours[0]] * (len(session_starts) - len(hours))
+
+        # Create sessions with actual durations
+        sessions = []
+        for i, session_start in enumerate(session_starts):
+            if i < len(hours):
+                session_end = session_start + datetime.timedelta(hours=hours[i])
+                sessions.append((session_start, session_end))
+
+        return sessions
+
+    @property
     def url(self):
         """Fetches the canonical URL for this event"""
         evt_id = self.neon_id
@@ -992,7 +1107,7 @@ class SignInEvent:
         return safe_parse_datetime(c).astimezone(dtz.UTC)
 
     @property
-    def clearances(self):
+    def clearances(self) -> list[ClearanceCodeFull]:
         """Returns list of clearances"""
         cc = self.airtable_data["fields"].get("Clearances")
         return [c.strip() for c in cc.split(",")] if cc else []

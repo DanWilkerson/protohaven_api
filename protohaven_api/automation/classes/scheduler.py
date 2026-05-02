@@ -28,8 +28,13 @@ def get_reserved_area_occupancy(
         area: AreaID = row["fields"].get("Name (from Shop Area)")
         if rid and area:
             id_to_area[str(rid)] = area
-    for res in booked.get_reservations(from_date, to_date)["reservations"]:
-        for area in id_to_area.get(res["resourceId"], []):
+    reservations = list(booked.get_reservations(from_date, to_date)["reservations"])
+    log.info(
+        f"Iterating over {len(reservations)} reservations looking for"
+        f" resourceIds: {list(id_to_area.keys())}"
+    )
+    for res in reservations:
+        for area in id_to_area.get(str(res["resourceId"]), []):
             # We use "buffered" start and end date, even though
             # currently it's the same value as start/end date.
             # There may be setup/teardown time incorporated in
@@ -67,9 +72,12 @@ def gen_class_and_area_stats(  # pylint: disable=too-many-locals
         # Repeats of the class are excluded based on the start and end run date
         first = c.sessions[0][0]
         last = c.sessions[-1][0]
+        # We add some wiggle room to the window to account for scheduling at e.g.
+        # 5pm on Jan 1st and 3pm on Jan 7th, even if period is 7 days
+        wiggle = min(datetime.timedelta(hours=12), c.period)
         exclusion_window = val.Exclusion(
-            start=first - c.period,
-            end=last + c.period,
+            start=first - (c.period - wiggle),
+            end=last + (c.period - wiggle),
             main_date=first,
             origin=c.name,
         )
@@ -79,9 +87,10 @@ def gen_class_and_area_stats(  # pylint: disable=too-many-locals
 
         # Clearances are excluded only based on start date, i.e. when a member
         # would have been able to register for the clearance
+        wiggle = min(datetime.timedelta(hours=12), clearance_exclusion_range)
         clearance_exclusion_window = val.Exclusion(
-            start=first - clearance_exclusion_range,
-            end=first + clearance_exclusion_range,
+            start=first - (clearance_exclusion_range - wiggle),
+            end=first + (clearance_exclusion_range - wiggle),
             main_date=first,  # Main date is included for reference
             origin=c.name,
         )
@@ -100,7 +109,14 @@ def gen_class_and_area_stats(  # pylint: disable=too-many-locals
                 env.instructor_occupancy[c.instructor_email].append(aoc)
 
     # Also pull in data from Booked scheduler to prevent overlap with manual reservations
-    for area, aocs in get_reserved_area_occupancy(start_date, end_date).items():
+    reserved_dt = datetime.timedelta(minutes=30)
+    reserved_occ = get_reserved_area_occupancy(
+        start_date - reserved_dt, end_date + reserved_dt
+    )
+    log.debug(
+        f"Reserved occupancy {start_date}-{end_date} +/- {reserved_dt}: {reserved_occ}"
+    )
+    for area, aocs in reserved_occ.items():
         env.area_occupancy[area] += aocs
     for v in env.area_occupancy.values():
         v.sort(key=lambda o: o[1])
@@ -192,6 +208,7 @@ def push_class_to_schedule(inst_id: NeonID, cls_id: RecordID, sessions: list[Int
         raise RuntimeError(f"Failed to fetch details of Neon account #{inst_id}")
     payload = {
         "Instructor": m.name,
+        "Instructor ID": inst_id,
         "Email": m.email,
         "Sessions": ",".join([ss[0].isoformat() for ss in sessions]),
         "Class": [cls_id],

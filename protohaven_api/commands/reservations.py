@@ -1,10 +1,14 @@
 """Commands related to reserving equipment and the Booked reservation system"""
 
 import argparse
+import datetime
 import logging
+from collections import defaultdict
 from functools import lru_cache
 
+from protohaven_api.automation.classes import events as eauto
 from protohaven_api.commands.decorator import arg, command, print_yaml
+from protohaven_api.config import tznow
 from protohaven_api.integrations import airtable, booked, neon
 from protohaven_api.integrations.comms import Msg
 
@@ -299,7 +303,7 @@ class Commands:
             booked_id = member.booked_id
             if not booked_id:
                 log.info(
-                    f"Active member {member.full_name} ({member.email}) with no Booked User ID"
+                    f"Active member {member.name} ({member.email}) with no Booked User ID"
                 )
                 existing_booked_user = email_to_booked_user.get(member_email_lower)
                 if existing_booked_user:
@@ -315,7 +319,7 @@ class Commands:
                         for e in u["errors"]:
                             log.error(e)
                         summary.append(
-                            f"Error(s) setting up Booked user for {member.full_name}: "
+                            f"Error(s) setting up Booked user for {member.name}: "
                             f"{u.get('errors')}"
                         )
                         continue
@@ -326,14 +330,14 @@ class Commands:
                     neon.set_booked_user_id(member.neon_id, booked_id)
                     summary.append(
                         f"Booked #{booked_id} associated with neon #{member.neon_id} "
-                        f"{member.full_name}"
+                        f"{member.name}"
                     )
                     log.info(summary[-1])
             else:
                 existing_booked_user = booked_user_data.get(booked_id)
                 if not existing_booked_user:
                     raise RuntimeError(
-                        f"Neon user {member.full_name} has invalid booked user ID {booked_id}"
+                        f"Neon user {member.name} has invalid booked user ID {booked_id}"
                     )
                 booked_member_ids.add(booked_id)
                 # Check if the booked user data matches the neon member data
@@ -396,4 +400,195 @@ class Commands:
                 ]
             )
         else:
+            print_yaml([])
+
+    @command(
+        arg(
+            "--apply",
+            help="If false, don't perform changes",
+            action=argparse.BooleanOptionalAction,
+            default=False,
+        ),
+        arg(
+            "--days",
+            help="Number of days in the future to check for orphaned reservations",
+            type=int,
+            default=90,
+        ),
+        arg(
+            "--max",
+            help="Max number of reservations to clean up",
+            default=10,
+        ),
+    )
+    def cleanup_orphaned_class_reservations(
+        self, args, pct
+    ):  # pylint: disable=too-many-locals,too-many-branches,too-many-statements
+        """Compare automation-created reservations with published classes and remove
+        reservations that no longer have a matching, published class.
+
+        This command:
+        1. Fetches automation-created reservations (made by system@protohaven.org)
+        2. Fetches published classes from Neon
+        3. Matches reservations to classes by time and area
+        4. Removes reservations without matching published classes
+        """
+
+        if not args.apply:
+            log.warning("==== --apply NOT SET, NO CHANGES WILL BE MADE ====")
+
+        pct.set_stages(4)
+
+        # Step 1: Fetch published classes from Neon with Airtable data
+        now = tznow()
+        end_date = now + datetime.timedelta(days=args.days)
+
+        log.info(f"Fetching published classes from {now} to {end_date}")
+        published_events = []
+
+        # Use fetch_upcoming_events which merges Neon and Airtable data
+        try:
+            for event in eauto.fetch_upcoming_events(
+                back_days=3,
+                published=True,  # Only published events
+                merge_airtable=True,  # Merge with Airtable schedule data (for areas)
+                attendees=False,
+                tickets=False,
+            ):
+                if not event.airtable_data:
+                    log.warning(
+                        f"Airtable data not matched for event {event.neon_id}: "
+                        f"{event.name} on {event.start_date}"
+                    )
+                    continue
+
+                # Check if event ends within our time window
+                if event.end_date and event.end_date <= end_date:
+                    published_events.append(event)
+        except (ConnectionError, TimeoutError, ValueError) as e:
+            log.warning(
+                f"Error fetching events: {e}. Continuing with empty event list."
+            )
+
+        log.info(f"Found {len(published_events)} published events with Airtable data")
+        published_events.sort(key=lambda e: e.start_date)
+        pct[0] = 1
+
+        # Step 2: Fetch automation-created reservations
+        # Use the new helper function that gets all automation reservations
+        interval = (now, end_date)
+        automation_reservations = list(booked.get_automation_reservations(interval))
+
+        log.info(
+            f"Found {len(automation_reservations)} automation-created reservations"
+        )
+        pct[1] = 1
+
+        # Step 3: Build map of class sessions by area and time
+        class_time_map = defaultdict(set)
+        for event in published_events:
+            log.info(f"{event.name} - {event.areas}")
+            for session_start, _ in event.sessions:
+                log.info(f"\t{session_start.isoformat()}")
+                for area in event.areas:
+                    class_time_map[area].add(session_start)
+
+        log.info(f"Built time map with {len(class_time_map)} areas")
+        if len(class_time_map) == 0:
+            raise RuntimeError("No classes found; no reservations will be cancelled")
+        pct[2] = 1
+
+        # Step 4: Identify orphaned reservations
+        orphaned_reservations = []
+        summary = []
+
+        # Get resource to area mapping (reverse of usual)
+        res_to_area = {
+            r: a for a, rr in booked.get_resource_area_map().items() for r in rr
+        }
+        log.info(f"Resource to area: {res_to_area}")
+
+        # Check each automation reservation
+        for reservation in automation_reservations:
+            reservation_area = res_to_area.get(reservation["resourceId"])
+            if not reservation_area:
+                log.warning(
+                    f"Could not find area for reservation "
+                    f"{reservation['referenceNumber']} with resource "
+                    f"{reservation['resourceId']}"
+                )
+                continue
+
+            # Look for matching class session by area and start time
+            reservation_start = reservation["startDate"]
+            found_match = False
+            time_tolerance = datetime.timedelta(minutes=5)
+            for class_start in class_time_map[reservation_area]:
+                if (
+                    abs((reservation_start - class_start).total_seconds())
+                    <= time_tolerance.total_seconds()
+                ):
+                    found_match = True
+                    log.info("Match found")
+                    break
+
+            if not found_match:
+                # This reservation doesn't have a matching published class
+                log.info("Match not found")
+                orphaned_reservations.append(
+                    {
+                        "reference_number": reservation["referenceNumber"],
+                        "resource_id": reservation["resourceId"],
+                        "resource_name": reservation["resourceName"],
+                        "area": reservation_area,
+                        "start": reservation_start,
+                        "title": reservation.get("title", ""),
+                    }
+                )
+
+                summary.append(
+                    f"Remove reservation #{reservation['referenceNumber']} for "
+                    f"{reservation['resourceName']} in {reservation_area} "
+                    f"({reservation_start}: "
+                    f"{reservation.get('title', 'No title')}"
+                )
+                log.info(summary[-1])
+                if len(orphaned_reservations) == args.max:
+                    log.info("Max number of reservations reached")
+                    break
+
+        pct[3] = 1
+
+        # Step 5: Remove orphaned reservations if apply is set
+        if args.apply and orphaned_reservations:
+            log.info(f"Removing {len(orphaned_reservations)} orphaned reservations")
+            for orphan in orphaned_reservations:
+                try:
+                    result = booked.delete_reservation(orphan["reference_number"])
+                    log.info(
+                        f"Deleted reservation #{orphan['reference_number']}: {result}"
+                    )
+                except (ConnectionError, TimeoutError, RuntimeError) as e:
+                    log.error(
+                        f"Failed to delete reservation #{orphan['reference_number']}: {e}"
+                    )
+                    summary.append(
+                        f"Failed to delete reservation #{orphan['reference_number']}: {e}"
+                    )
+
+        # Output summary
+        if len(summary) > 0:
+            print_yaml(
+                [
+                    Msg.tmpl(
+                        "orphaned_reservations_cleanup",
+                        target="#tool-automation",
+                        changes=summary,
+                        n=len(orphaned_reservations),
+                        apply=args.apply,
+                    )
+                ]
+            )
+        else:
+            log.info("No orphaned reservations found")
             print_yaml([])

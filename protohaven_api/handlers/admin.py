@@ -9,7 +9,7 @@ from protohaven_api.automation.membership import clearances as mclearance
 from protohaven_api.automation.membership import membership as memauto
 from protohaven_api.config import get_config
 from protohaven_api.handlers.auth import login_with_neon_id
-from protohaven_api.integrations import airtable, comms, mqtt, neon_base, tasks
+from protohaven_api.integrations import airtable, comms, mqtt, neon, neon_base, tasks
 from protohaven_api.rbac import (
     Role,
     require_dev_environment,
@@ -30,6 +30,20 @@ def login_as_user():
     log.warning(f"Logging in as user #{neon_id}")
     login_with_neon_id(neon_id)
     return session["neon_account"]
+
+
+@page.route("/admin/discord_webhook", methods=["POST"])
+@require_login_role(Role.AUTOMATION)
+def admin_discord_webhook():
+    """Send discord webhook message - use this if you get rate
+    limited sending directly from third party services e.g.
+    Appscript, Airtable..."""
+    data = request.json
+    content = data["content"]
+    channel = data["channel"]
+    log.info(f"/admin/discord_webhook: channel {channel}, content: {content}")
+    comms.send_discord_message(content=content, channel=channel, blocking=False)
+    return "Sent (non-blocking)"
 
 
 @page.route("/user/clearances", methods=["GET", "PATCH", "DELETE"])
@@ -55,16 +69,27 @@ def user_clearances():
 
     for e in emails:
         try:
+            resolved = list(
+                filter(
+                    lambda d: d is not None,
+                    [neon.resolve_clearance_code_full(d) for d in delta],
+                )
+            )
+            if len(resolved) != len(delta):
+                raise KeyError(
+                    f"Could not fully resolve all codes: {delta}. Resolved codes: {resolved}"
+                )
+
             results[e] = {
                 "method": request.method,
                 "delta": delta,
-                "result": mclearance.update(e, request.method, delta),
+                "result": mclearance.update(e, request.method, resolved),
                 "status": 200,
             }
         except RuntimeError as exc:
             results[e] = {
                 "method": request.method,
-                "delta": delta,
+                "delta": resolved,
                 "result": [],
                 "status": 500,
                 "message": str(exc),
@@ -72,7 +97,7 @@ def user_clearances():
         except KeyError as exc:
             results[e] = {
                 "method": request.method,
-                "delta": delta,
+                "delta": resolved,
                 "result": [],
                 "status": 404,
                 "message": str(exc),
@@ -80,7 +105,7 @@ def user_clearances():
         except TypeError as exc:
             results[e] = {
                 "method": request.method,
-                "delta": delta,
+                "delta": resolved,
                 "result": [],
                 "status": 400,
                 "message": str(exc),
@@ -234,3 +259,92 @@ def tool_maintenance_submission():
         mqtt.notify_maintenance(tool, status, summary)
 
     return "OK"
+
+
+@page.route("/admin/asana_webhook", methods=["POST"])
+def asana_webhook():  # pylint: disable=too-many-locals
+    """Handle Asana webhooks for purchase request notifications.
+
+    When a new task is created in the purchase_requests project, send a notification
+    to the #supply-automation Discord channel.
+
+    Security: This endpoint relies on the webhook URL being kept secret.
+    Asana webhooks don't include signature verification by default.
+    In production, consider adding IP whitelisting or a shared secret.
+    """
+    # Check if webhook is enabled
+    is_enabled = get_config(
+        "asana/webhooks/purchase_requests/enabled", default=False, as_bool=True
+    )
+    if not is_enabled:
+        log.info(
+            f"Skipping Asana webhook - not enabled in config (value: {is_enabled})"
+        )
+        return Response("Asana webhook disabled via config", status=200)
+
+    # Handle webhook verification (Asana sends X-Hook-Secret for initial handshake)
+    webhook_secret = request.headers.get("X-Hook-Secret")
+    if webhook_secret:
+        # This is a webhook verification request - echo back the secret
+        response = Response("", status=200)
+        response.headers["X-Hook-Secret"] = webhook_secret
+        log.info(f"Asana webhook verification received with secret: {webhook_secret}")
+        return response
+
+    # Get the webhook payload
+    if not request.is_json:
+        log.warning("Asana webhook received without JSON content")
+        return Response("Expected JSON payload", status=400)
+
+    payload = request.json
+    log.info(f"Received Asana webhook with {len(payload.get('events', []))} events")
+
+    # Check if this is a task added event
+    events = payload.get("events", [])
+    for event in events:
+        log.info(f"{event}")
+        if (
+            event.get("resource", {}).get("resource_type") == "task"
+            and event.get("action") == "added"
+        ):
+            task_gid = event.get("resource", {}).get("gid")
+            project_gid = event.get("parent", {}).get("gid")
+
+            # Check if this is from the purchase_requests project
+            purchase_requests_gid = get_config("asana/purchase_requests/gid")
+            if str(project_gid) == str(purchase_requests_gid):
+                # Fetch task details
+                try:
+                    task = tasks.get_task(task_gid)
+                    task_url = (
+                        f"https://app.asana.com/0/{purchase_requests_gid}/{task_gid}"
+                    )
+
+                    # Get notes/description if any
+                    notes = task.get("notes", "")
+                    notes_preview = notes[:256] + "..." if len(notes) > 256 else notes
+                    # Format Discord message
+                    message = (
+                        f"🛒 **New Purchase Request** - [link]({task_url})\n\n"
+                        f"{notes_preview}"
+                    )
+
+                    # Send to Discord
+                    comms.send_discord_message(
+                        message, "#supply-automation", blocking=False
+                    )
+                    log.info(f"Sent purchase request notification for task {task_gid}")
+
+                except Exception as e:  # pylint: disable=broad-exception-caught
+                    message = f"Error processing Asana webhook for task {task_gid}: {e}"
+                    log.error(message)
+                    try:
+                        comms.send_discord_message(
+                            message, "#supply-automation", blocking=False
+                        )
+                    except Exception as e2:  # pylint: disable=broad-exception-caught
+                        log.error(str(e2))
+                    # Don't fail the webhook - Asana will retry
+                    # Return 200 so Asana doesn't retry
+
+    return Response("OK", status=200)

@@ -8,7 +8,7 @@ import re
 from protohaven_api.automation.techs import techs as forecast
 from protohaven_api.commands.decorator import arg, command, print_yaml
 from protohaven_api.config import safe_parse_datetime, tznow
-from protohaven_api.integrations import airtable, tasks
+from protohaven_api.integrations import airtable, tasks, wyze
 from protohaven_api.integrations.comms import Msg
 
 log = logging.getLogger("cli.forwarding")
@@ -142,17 +142,16 @@ class Commands:
         num = 0
         reqs = []
         now = tznow()
-        for c in airtable.get_class_automation_schedule():
-            d = safe_parse_datetime(c["fields"]["Start Time"])
-            if d < now or c["fields"]["Supply State"] != "Supplies Requested":
+        for c in airtable.get_class_automation_schedule(raw=False):
+            if c.start_time < now or c.supply_state != "Supplies Requested":
                 continue
 
             reqs.append(
                 {
-                    "days": (d - now).days,
-                    "name": ", ".join(c["fields"]["Name (from Class)"]),
-                    "date": d.strftime("%Y-%m-%d"),
-                    "inst": c["fields"]["Instructor"],
+                    "days": (c.start_time - now).days,
+                    "name": c.name,
+                    "date": c.start_time.strftime("%Y-%m-%d"),
+                    "inst": c.instructor_name,
                 }
             )
             log.info(str(reqs[-1]))
@@ -327,7 +326,7 @@ class Commands:
     @command(
         arg("--now", help="Override current time", type=str, default=None),
     )
-    def tech_sign_ins(self, args, _):
+    def tech_sign_ins(self, args, _):  # pylint: disable=too-many-locals
         """Craft a notification to indicate whether the scheduled techs have signed in
         for their shift"""
         now = tznow() if not args.now else safe_parse_datetime(args.now)
@@ -384,12 +383,19 @@ class Commands:
 
         result = []
         if not on_duty_ok:
+            # Only get door states for AM shifts
+            door_states = []
+            if shift.endswith("AM"):
+                door_states = list(wyze.get_door_states())
+                log.info(f"Got door states for AM shift: {door_states}")
+
             result.append(
                 Msg.tmpl(
                     "shift_no_techs",
                     target="#tech-automation",
                     shift=shift,
                     onduty=techs_on_duty,
+                    door_states=door_states,
                 )
             )
 

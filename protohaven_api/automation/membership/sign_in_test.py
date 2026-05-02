@@ -114,7 +114,7 @@ def test_log_sign_in(mocker):
         "referrer": "friend",
         "person": "member",
     }
-    result = {"waiver_signed": True}
+    result = {"waiver_signed": True, "member_agreement_accepted": False}
     send = mocker.Mock()
 
     mocker.patch.object(s.forms, "submit_google_form", return_value="google_response")
@@ -461,7 +461,7 @@ def test_handle_waiver_checks_expiration(mocker):
 def test_as_guest_no_referrer(mocker):
     """Guest data with no referrer is omitted from form submission"""
     m = mocker.patch.object(s, "_apply_async")
-    got = s.as_guest({"person": "guest", "waiver_ack": True})
+    got = s.as_guest({"person": "guest", "email": "a@b.com", "waiver_ack": True})
     assert got["waiver_signed"] == True
     m.assert_not_called()
 
@@ -498,11 +498,13 @@ def test_as_member_notfound(mocker):
     assert got == {
         "announcements": [],
         "firstname": "member",
+        "member_agreement_accepted": False,
         "notfound": True,
         "status": "Unknown",
         "violations": [],
         "waiver_signed": False,
         "neon_id": "",
+        "reservations": [],
     }
     m.assert_not_called()
 
@@ -522,6 +524,7 @@ def test_as_member_activate_deferred(mocker):
         roles=[],
         clearances=[],
         waiver_accepted=(None, None),
+        member_agreement_accepted=(None, None),
         announcements_acknowledged=None,
     )
     mocker.patch.object(
@@ -567,6 +570,7 @@ def test_as_member_expired(mocker):
                     clearances=[],
                     account_automation_ran="",
                     waiver_accepted=(None, None),
+                    member_agreement_accepted=(None, None),
                     announcements_acknowledged=None,
                 ),
             },
@@ -612,6 +616,7 @@ def test_as_member_violations(mocker):
                     clearances=[],
                     account_automation_ran="",
                     waiver_accepted=(None, None),
+                    member_agreement_accepted=(None, None),
                     announcements_acknowledged=None,
                 ),
             }
@@ -660,6 +665,7 @@ def test_as_member_duplicates(mocker):
                     clearances=[],
                     account_automation_ran="",
                     waiver_accepted=(None, None),
+                    member_agreement_accepted=(None, None),
                     announcements_acknowledged=None,
                 ),
                 12345: mocker.MagicMock(
@@ -670,6 +676,7 @@ def test_as_member_duplicates(mocker):
                     clearances=[],
                     account_automation_ran="",
                     waiver_accepted=(None, None),
+                    member_agreement_accepted=(None, None),
                     announcements_acknowledged=None,
                 ),
             }
@@ -711,6 +718,7 @@ def test_as_member_announcements_ok(mocker):
                     clearances=["Clearance A", "Clearance B"],
                     account_automation_ran="",
                     waiver_accepted=(None, None),
+                    member_agreement_accepted=(None, None),
                     announcements_acknowledged=None,
                 ),
             }
@@ -752,6 +760,7 @@ def test_as_member_announcements_ok(mocker):
                 email="a@b.com",
                 dependent_info="DEP_INFO",
                 waiver_ack=True,
+                member_agreement_accepted=False,
                 referrer=None,
                 purpose="I'm a member, just signing in!",
                 am_member=True,
@@ -783,6 +792,7 @@ def test_as_member_announcements_exception(mocker):
                     clearances=[],
                     account_automation_ran="",
                     waiver_accepted=(None, None),
+                    member_agreement_accepted=(None, None),
                     announcements_acknowledged=None,
                 ),
             }
@@ -810,37 +820,48 @@ def test_as_member_company_id(mocker):
     """Test that form submission triggers and a discord notification is sent if there's duplicate accounts"""
     mocker.patch.object(s, "_apply_async")
     mocker.patch.object(s, "notify_async")
-    mocker.patch.object(
-        s.neon,
-        "cache",
-        {
-            "a@b.com": {
-                12346: mocker.MagicMock(
-                    neon_id=12346,
-                    company_id=12346,  # Matches account ID, so ignored
-                    account_current_membership_status="Active",
-                    roles=[],
-                    clearances=[],
-                    account_automation_ran="",
-                    waiver_accepted=(None, None),
-                    announcements_acknowledged=None,
-                ),
-                12345: mocker.MagicMock(
-                    neon_id=12345,
-                    company_id=12346,
-                    account_current_membership_status="Active",
-                    roles=[{"name": "Shop Tech"}],
-                    fname="First",
-                    clearances=[],
-                    account_automation_ran="",
-                    waiver_accepted=(None, None),
-                    announcements_acknowledged=None,
-                ),
-            }
-        },
+
+    # Create a proper mock for neon.cache
+    mock_neon_cache = mocker.MagicMock()
+    mock_neon_cache.get = mocker.MagicMock(
+        return_value={
+            12346: mocker.MagicMock(
+                neon_id=12346,
+                company_id=12346,  # Matches account ID, so ignored
+                account_current_membership_status="Active",
+                roles=[],
+                clearances=[],
+                account_automation_ran="",
+                waiver_accepted=(None, None),
+                member_agreement_accepted=(None, None),
+                announcements_acknowledged=None,
+            ),
+            12345: mocker.MagicMock(
+                neon_id=12345,
+                company_id=12346,
+                account_current_membership_status="Active",
+                roles=[{"name": "Shop Tech"}],
+                fname="First",
+                clearances=[],
+                account_automation_ran="",
+                waiver_accepted=(None, None),
+                member_agreement_accepted=(None, None),
+                announcements_acknowledged=None,
+            ),
+        }
     )
+    mock_neon_cache.booked_users = mocker.MagicMock(return_value={})
+    mocker.patch.object(s.neon, "cache", mock_neon_cache)
+
     mocker.patch.object(s.airtable.cache, "announcements_after", return_value=[])
     mocker.patch.object(s.airtable.cache, "violations_for", return_value=[])
+    mocker.patch.object(s.airtable, "get_tools", return_value=[])
+    # Mock booked.cache properly
+    mock_booked_cache = mocker.MagicMock()
+    mock_booked_cache.__getitem__ = mocker.MagicMock(
+        side_effect=lambda key: [] if key == "reservations" else None
+    )
+    mocker.patch.object(s.booked, "cache", mock_booked_cache)
     rep = s.as_member(
         {
             "person": "member",
@@ -879,6 +900,7 @@ def test_as_member_notify_board_and_staff(mocker, status):
                     clearances=[],
                     account_automation_ran="",
                     waiver_accepted=(None, None),
+                    member_agreement_accepted=(None, None),
                     notify_board_and_staff=["On Sign In", "Other Unrelated Condition"],
                     announcements_acknowledged=None,
                 ),

@@ -4,7 +4,7 @@ import {onMount} from 'svelte';
 import { Badge, Toast, Popover, ToastHeader, ToastBody, Dropdown, DropdownToggle, DropdownMenu, DropdownItem, Table, ListGroup, ListGroupItem, Button, Card, CardHeader, CardTitle, CardSubtitle, CardBody, Input, Spinner } from '@sveltestrap/sveltestrap';
 
 import FetchError from '../fetch_error.svelte';
-import {get, post} from '$lib/api.ts';
+import {get, post, open_ws} from '$lib/api.ts';
 import EditCell from './editable_td.svelte'
 
 export let visible;
@@ -14,7 +14,7 @@ let searching = false;
 let promise = new Promise((r,_)=>{r([])});
 function search_member() {
   searching = true;
-  promise = post(`/neon_lookup?search=${search}`).finally(() => searching = false);
+  promise = post(`/neon_lookup?search=${encodeURIComponent(search)}`).finally(() => searching = false);
 }
 
 let fetching = false;
@@ -36,38 +36,55 @@ $: {
   } else if (sort_type === "type") {
     subs_sorted = [...subs].sort((a, b) => a.storage_type.localeCompare(b.storage_type));
   } else if (sort_type === "idnum") {
-    subs_sorted = [...subs].sort((a, b) => a.id.localeCompare(b.id));
+    subs_sorted = [...subs].sort((a, b) => a.id.toString().localeCompare(b.id.toString()));
   } else if (sort_type === "detail") {
     subs_sorted = [...subs].sort((a, b) => a.storage_detail.toLowerCase().localeCompare(b.storage_detail.toLowerCase()));
   }
 }
+
+let sub_fetch_status = "";
 function get_subs() {
   fetching = true;
+  sub_fetch_status = "";
   console.log("get_subs");
-  subs_promise = get('/techs/storage_subscriptions').then((data) => {
-    subs = [];
-    includes_email = false;
-    for (let d of data) {
-      includes_email = includes_email || Boolean(d.email);
-      let parsed = {};
-      try {
-        parsed = JSON.parse(d["note"]) || {};
-        console.log("Parsed", parsed);
-      } catch (e) {
-        parsed = {};
-        console.warn("Failed parsing note", d, e);
-      }
-      d["storage_type"] = parsed["storage_type"] || "Unknown";
-      d["storage_id"] = parsed["storage_id"] || "Unknown";
-      d["storage_detail"] = parsed["storage_detail"] || d["note"] || "Unknown";
-    }
-    subs = [...data];
+  const socket = open_ws('/techs/storage_subscriptions');
+  socket.addEventListener("close", (event) => {
+    console.log(event);
+    fetching = false;
     loaded = true;
-    console.log(subs);
-  }).catch((err) => {
-    console.error(err);
-    throw err;
-  }).finally(() => fetching = false);
+  });
+  subs = [];
+  includes_email = false;
+  socket.addEventListener("message", (event) => {
+    let d= JSON.parse(event.data);
+    if (d.error) {
+      alert(d.error);
+      return;
+    }
+    if (d.log_info) {
+      sub_fetch_status = d.log_info;
+      console.log(sub_fetch_status);
+      return;
+    }
+    includes_email = includes_email || Boolean(d.email);
+    let parsed = {};
+    try {
+      parsed = JSON.parse(d["note"]) || {};
+      console.log("Parsed", parsed);
+    } catch (e) {
+      parsed = {};
+      console.warn("Failed parsing note", d, e);
+    }
+    d["storage_type"] = parsed["storage_type"] || "Unknown";
+    d["storage_id"] = parsed["storage_id"] || "Unknown";
+    d["storage_detail"] = parsed["storage_detail"];
+    if (d["storage_detail"] === undefined) {
+      d["storage_detail"] = d["note"] || "";
+    }
+    d["editable"] = d["plan"] !== "Non-Square Agreement";
+    subs.push(d);
+    subs = subs;
+  });
 }
 
 function handle_storage_type_select(evt, sub, typ){
@@ -141,91 +158,98 @@ $: {
 <Card class="my-3">
 <CardHeader>
 <CardTitle>Storage Subscriptions</CardTitle>
-<CardSubtitle>View active subscriptions and add details</CardSubtitle>
+<CardSubtitle>View active subscriptions and add details*</CardSubtitle>
 </CardHeader>
 <CardBody>
+    <div class="my-2"><em>*Non-Square storage agreements are editable <a href="https://airtable.com/appZIwlIgaq1Ps28Y/tblFoG5HKnRfuZsD7/viw3tzhfEh5trfBuH?blocks=hide" target="_blank">on Airtable</a></em></div>
     {#if sub_note_editing}
-      <Spinner/>
+      <Spinner/> {sub_fetch_status}
     {/if}
-    {#await subs_promise}
+    {#if fetching}
       <Spinner/> Loading storage subscriptions... this may take up to a minute
-    {:then p}
-        <Toast class="me-1" style="z-index: 10000; position:fixed; bottom: 2vh; right: 2vh;" autohide isOpen={toast_msg} on:close={() => (toast_msg = null)}>
-          <ToastHeader icon={toast_msg.color}>{toast_msg.title}</ToastHeader>
-          <ToastBody>{toast_msg.msg}</ToastBody>
-        </Toast>
-        <Dropdown>
-            <DropdownToggle color="light" caret>
-                Sort
-            </DropdownToggle>
-            <DropdownMenu>
-                <DropdownItem on:click={() => sort_type="name" }>By Name</DropdownItem>
-                <DropdownItem on:click={() => sort_type="plan" }>By Plan (subscription name in Square)</DropdownItem>
-                <DropdownItem on:click={() => sort_type="memstatus" }>By Membership Status</DropdownItem>
-                <DropdownItem on:click={() => sort_type="startdate" }>By Start Date</DropdownItem>
-                <DropdownItem on:click={() => sort_type="type" }>By Storage Type</DropdownItem>
-                <DropdownItem on:click={() => sort_type="idnum" }>By Storage ID</DropdownItem>
-                <DropdownItem on:click={() => sort_type="detail" }>By Details</DropdownItem>
-            </DropdownMenu>
-        </Dropdown>
-        <Table>
-          <thead>
-            <th>Name</th>
-            {#if includes_email}<th>Email</th>{/if}
-            <th>Plan</th>
-            <th>Membership</th>
-            <th>Start Date</th>
-            <th>Type</th>
-            <th>ID</th>
-            <th>Detail</th>
-          </thead>
-          <tbody>
-          {#each subs_sorted as sub, i}
-            <tr>
-                <td>{sub.customer}
-                {#if sub.unpaid.length > 0}
-                <Badge style="cursor: pointer;" id={"sub" + i} color="danger">{sub.unpaid.length}</Badge>
-                <Popover
-                    target={"sub" + i}
-                    placement="right"
-                    title="Unpaid invoices"
-                  >
-                      {#each sub.unpaid as inv_id}
-                      <div>
-                        <a href={"https://app.squareup.com/dashboard/invoices/" + inv_id}>{inv_id}</a>
-                      </div>
-                      {/each}
-                  </Popover>
+    {/if}
+    <Toast class="me-1" style="z-index: 10000; position:fixed; bottom: 2vh; right: 2vh;" autohide isOpen={toast_msg} on:close={() => (toast_msg = null)}>
+      <ToastHeader icon={toast_msg.color}>{toast_msg.title}</ToastHeader>
+      <ToastBody>{toast_msg.msg}</ToastBody>
+    </Toast>
+    <Dropdown>
+        <DropdownToggle color="secondary" caret>
+            Sort
+        </DropdownToggle>
+        <DropdownMenu>
+            <DropdownItem on:click={() => sort_type="name" }>By Name</DropdownItem>
+            <DropdownItem on:click={() => sort_type="plan" }>By Plan (subscription name in Square)</DropdownItem>
+            <DropdownItem on:click={() => sort_type="memstatus" }>By Membership Status</DropdownItem>
+            <DropdownItem on:click={() => sort_type="startdate" }>By Start Date</DropdownItem>
+            <DropdownItem on:click={() => sort_type="type" }>By Storage Type</DropdownItem>
+            <DropdownItem on:click={() => sort_type="idnum" }>By Storage ID</DropdownItem>
+            <DropdownItem on:click={() => sort_type="detail" }>By Details</DropdownItem>
+        </DropdownMenu>
+    </Dropdown>
+    <Table>
+      <thead>
+        <th>Name</th>
+        {#if includes_email}<th>Email</th>{/if}
+        <th>Plan</th>
+        <th>Membership</th>
+        <th>Start Date</th>
+        <th>Type</th>
+        <th>ID</th>
+        <th>Detail</th>
+      </thead>
+      <tbody>
+      {#each subs_sorted as sub, i}
+        <tr>
+            <td>{sub.customer}
+            {#if sub.unpaid.length > 0}
+            <Badge style="cursor: pointer;" id={"sub" + i} color="danger">{sub.unpaid.length}</Badge>
+            <Popover
+                target={"sub" + i}
+                placement="right"
+                title="Unpaid invoices"
+              >
+                  {#each sub.unpaid as inv_id}
+                  <div>
+                    <a href={"https://app.squareup.com/dashboard/invoices/" + inv_id}>{inv_id}</a>
+                  </div>
+                  {/each}
+              </Popover>
 
-                {/if}
-                </td>
-                {#if includes_email}<td>{sub.email}</td>{/if}
-                <td>{sub.plan}</td>
-                <td>{sub.membership_status}</td>
-                <td>{sub.start_date}</td>
-                <td>
-                <Dropdown autoClose={true}>
-                    <DropdownToggle caret>{sub.storage_type}</DropdownToggle>
-                    <DropdownMenu>
-                      {#each ["Cart", "Table", "Parking space", "Board/bar", "Sheet", "Locker", "Cage", "Rack", "Other", "Unknown"] as typ}
-                        <DropdownItem disabled={sub_note_editing} on:click={(e) => handle_storage_type_select(e, sub, typ)}>{typ}</DropdownItem>
-                      {/each}
-                    </DropdownMenu>
-                </Dropdown>
-                </td>
-                <td>
-                <EditCell enabled={!sub_note_editing} on_change={() => update_sub_note(sub)} bind:value={sub.storage_id}/>
-                </td>
-                <td>
-                <EditCell  enabled={!sub_note_editing} on_change={() => update_sub_note(sub)} bind:value={sub.storage_detail}/>
-                </td>
-            </tr>
-          {/each}
-        </tbody>
-      </Table>
-    {:catch error}
-      <FetchError {error}/>
-    {/await}
+            {/if}
+            </td>
+            {#if includes_email}<td>{sub.email}</td>{/if}
+            <td>
+            {#if sub.plan == "Non-Square Agreement" }
+              {sub.plan}
+            {:else}
+              <a href={"https://app.squareup.com/dashboard/subscriptions-list/" + sub.id}>{sub.plan}</a>
+            {/if}
+            {#if sub.status !== "ACTIVE"}
+              ({sub.status})
+            {/if}
+            </td>
+            <td>{sub.membership_status}</td>
+            <td>{sub.start_date}</td>
+            <td>
+            <Dropdown autoClose={true}>
+                <DropdownToggle color="light" caret>{sub.storage_type}</DropdownToggle>
+                <DropdownMenu>
+                  {#each ["Cart", "Table", "Parking space", "Board/bar", "Sheet", "Locker", "Cage", "Rack", "Other", "Unknown"] as typ}
+                    <DropdownItem disabled={!sub.editable || sub_note_editing} on:click={(e) => handle_storage_type_select(e, sub, typ)}>{typ}</DropdownItem>
+                  {/each}
+                </DropdownMenu>
+            </Dropdown>
+            </td>
+            <td>
+            <EditCell enabled={sub.editable && !sub_note_editing} on_change={() => update_sub_note(sub)} bind:value={sub.storage_id}/>
+            </td>
+            <td>
+            <EditCell  enabled={sub.editable && !sub_note_editing} on_change={() => update_sub_note(sub)} bind:value={sub.storage_detail}/>
+            </td>
+        </tr>
+      {/each}
+    </tbody>
+  </Table>
 </CardBody>
 </Card>
 <div style="height: 120px"></div>

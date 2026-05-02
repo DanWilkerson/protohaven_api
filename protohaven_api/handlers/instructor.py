@@ -2,7 +2,6 @@
 
 import datetime
 import logging
-from collections import defaultdict
 from typing import Any, Optional, Union
 
 from dateutil import parser as dateparser
@@ -12,14 +11,14 @@ from protohaven_api.automation.classes import events as eauto
 from protohaven_api.automation.classes import scheduler
 from protohaven_api.automation.classes import validation as val
 from protohaven_api.config import get_config, safe_parse_datetime, tznow
-from protohaven_api.handlers.auth import user_email, user_fullname
+from protohaven_api.handlers.auth import user_email, user_fullname, user_id
 from protohaven_api.integrations import (
     airtable,
-    airtable_base,
     booked,
     comms,
     neon,
     neon_base,
+    sheets,
 )
 from protohaven_api.integrations.models import Role
 from protohaven_api.rbac import am_lead_role, am_role, require_login_role
@@ -59,7 +58,6 @@ def get_instructor_readiness(inst: list, caps: Optional[Any] = None) -> dict:
         result["email_status"] = f"{len(inst)} duplicate accounts in Neon"
     inst_member = inst[0]  # Get the first member from the list
 
-    log.info(str(inst_member))
     result["email"] = inst_member.email
     result["neon_id"] = inst_member.neon_id
     if inst_member.account_current_membership_status == "Active":
@@ -100,19 +98,27 @@ def get_instructor_readiness(inst: list, caps: Optional[Any] = None) -> dict:
     return result
 
 
-def _resolve_email():
+def _resolve_id_and_email() -> tuple[str, str, Response]:
     email = request.args.get("email")
     if email is not None:
         ue = user_email()
         if ue != email and not am_role(Role.ADMIN, Role.EDUCATION_LEAD, Role.STAFF):
-            return None, Response(
-                "Access Denied for admin parameter `email`", status=401
+            return (
+                None,
+                None,
+                Response("Access Denied for admin parameter `email`", status=401),
             )
+        # Account ID included by default
+        mm = list(neon.search_members_by_email(ue.lower(), fields=[]))
+        if len(mm) == 0:
+            return Response(f"No Neon accounts with email {email.lower()}", status=404)
+        nid = mm[0].neon_id
     else:
         email = user_email()
+        nid = user_id()
         if not email:
-            return None, Response("You are not logged in.", status=401)
-    return email, None
+            return None, None, Response("You are not logged in.", status=401)
+    return email, nid, None
 
 
 @page.route("/instructor/class/templates")
@@ -179,7 +185,9 @@ def instructor_class_selector_redirect2() -> Any:
     return redirect("/instructor")
 
 
-def get_dashboard_schedule_sorted(email, now=None) -> list[airtable.ScheduledClass]:
+def get_dashboard_schedule_sorted(
+    neon_id, email, now=None
+) -> list[airtable.ScheduledClass]:
     """Fetches the class schedule for an individual instructor.
     Excludes unconfirmed classes sooner than HIDE_UNCONFIRMED_DAYS_AHEAD
     as well as confirmed classes older than HIDE_CONFIRMED_DAYS_AFTER"""
@@ -189,7 +197,7 @@ def get_dashboard_schedule_sorted(email, now=None) -> list[airtable.ScheduledCla
     age_out_thresh = now - datetime.timedelta(days=HIDE_CONFIRMED_DAYS_AFTER)
     confirmation_thresh = now + datetime.timedelta(days=HIDE_UNCONFIRMED_DAYS_AHEAD)
     for s in airtable.get_class_automation_schedule(raw=False):
-        if s.instructor_email != email or s.rejected:
+        if (s.instructor_id != neon_id and s.instructor_email != email) or s.rejected:
             continue
         if s.confirmed and s.end_time <= age_out_thresh:
             continue
@@ -243,16 +251,17 @@ def instructor_class_svelte_files(typ, path):
 @require_login_role(Role.INSTRUCTOR, Role.EDUCATION_LEAD, Role.STAFF)
 def instructor_class_details():
     """Display all class information about a particular instructor (via email)"""
-    email, rep = _resolve_email()
+    email, neon_id, rep = _resolve_id_and_email()
     if rep:
         return rep
 
     email = email.lower()
-    sched = get_dashboard_schedule_sorted(email)
+    sched = get_dashboard_schedule_sorted(neon_id, email)
     return {
         "schedule": [c.as_response() for c in sched],
         "now": tznow(),
         "email": email,
+        "neon_id": neon_id,
     }
 
 
@@ -273,7 +282,7 @@ def instructor_class_supply_req():
     """Mark supplies as missing or confirmed for a class"""
     data = request.json
     eid = data["eid"]
-    c = airtable.get_scheduled_class(eid, raw=False)
+    c = airtable.get_scheduled_class(eid)
     if not c:
         raise RuntimeError(f"Not found: class {eid}")
 
@@ -300,39 +309,30 @@ def instructor_class_volunteer():
     return airtable.mark_schedule_volunteer(eid, v).as_response()
 
 
-@page.route("/instructor/admin_data", methods=["GET"])
-@require_login_role(Role.EDUCATION_LEAD, Role.BOARD_MEMBER, Role.STAFF)
-def admin_data():
-    """Fetches and returns admin info for Edu Leads and other privileged roles"""
-    result = defaultdict(list)
-    for inst in airtable_base.get_all_records("class_automation", "capabilities"):
-        result["capabilities"].append(
-            {
-                "name": inst["fields"].get("Instructor") or "unknown",
-                "email": inst["fields"].get("Email") or "unknown",
-                "neon_id": inst["fields"].get("Neon ID") or None,
-                "active": inst["fields"].get("Active") or False,
-            }
-        )
-    for tmpl in airtable_base.get_all_records("class_automation", "classes"):
-        fields = tmpl.get("fields") or {}
-        result["classes"].append(
-            {
-                "name": fields.get("Name"),
-                "approved": fields.get("Approved"),
-                "schedulable": fields.get("Schedulable"),
-                "clearances earned": fields.get("Clearances Earned"),
-                "age requirement": fields.get("Age Requirement"),
-                "capacity": fields.get("Capacity"),
-                "supply_cost": fields.get("Supply Cost"),
-                "price": fields.get("Price"),
-                "hours": fields.get("Hours"),
-                "period": fields.get("Period"),
-                "name (from area)": fields.get("Name (from Area)"),
-                "image link": fields.get("Image Link"),
-            }
-        )
-    return dict(result)
+@page.route("/instructor/list")
+@require_login_role(
+    Role.SHOP_TECH_LEAD, Role.EDUCATION_LEAD, Role.STAFF, Role.BOARD_MEMBER
+)
+def instructor_list():
+    """Fetches instructor info with role-based field restrictions
+
+    Returns:
+    - For all users: basic instructor info (enrolled instructors only)
+    - For education leads/staff/admin/board: full capabilities data
+    """
+    result = {
+        "enrollment_map": {
+            m.neon_id: m.name
+            for m in neon.search_members_with_role(
+                Role.INSTRUCTOR, fields=["First Name", "Last Name", "Preferred Name"]
+            )
+        },
+        "capabilities": airtable.get_all_instructor_capabilities_formatted(),
+        "classes": [
+            tmpl.as_response() for tmpl in airtable.get_all_class_templates(raw=False)
+        ],
+    }
+    return result
 
 
 def _resolve_class_proposal_params():
@@ -358,22 +358,12 @@ def _resolve_class_proposal_params():
     for s in data["sessions"]:
         log.info(f"Parsing session {s}")
         sessions.append(tuple(safe_parse_datetime(t) for t in s))
-    inst_id, rep = _resolve_email()
+    _, inst_id, rep = _resolve_id_and_email()
 
     skip_val = data.get("skip_validation") or False
     if not isinstance(skip_val, bool):  # Strict checks on validation override
         skip_val = False
-    log.info(f"skip_val: {skip_val}")
-    if skip_val and not am_role(Role.ADMIN, Role.EDUCATION_LEAD, Role.STAFF):
-        return (
-            None,
-            None,
-            None,
-            Response("`skip_validation` permission denied", status=400),
-            False,
-        )
-
-    return cls_id, sessions, inst_id, rep, data.get("skip_validation") or False
+    return cls_id, sessions, inst_id, rep, skip_val
 
 
 @page.route("/instructor/validate", methods=["POST"])
@@ -398,18 +388,45 @@ def push_class():
     if rep:
         return rep
 
-    if not skip_validation:
-        log.info(
-            f"Validating instructor {inst_id} class schedule for {cls_id}: {sessions}"
-        )
-        errors = scheduler.validate(inst_id, cls_id, sessions)
-        log.info(f"Result: {errors}")
-        if len(errors) > 0:
+    m = neon_base.fetch_account(inst_id)
+    if not m:
+        raise RuntimeError(f"Failed to fetch details of Neon account #{inst_id}")
+
+    log.info(f"Validating instructor {inst_id} class schedule for {cls_id}: {sessions}")
+    errors = scheduler.validate(inst_id, cls_id, sessions)
+    log.info(f"Result: {errors}")
+    if len(errors) > 0:
+        if not skip_validation:
             return {"valid": len(errors) == 0, "errors": errors}
+
+        log.info("Fetching class template for warning to edu leads")
+        c = airtable.get_class_template(cls_id)
+        if not c:
+            raise RuntimeError(f"Failed to fetch class template {cls_id}")
+
+        # We send a blocking notification *before* unvalidated pushes to reduce the odds
+        # of the notification failing and classes getting force pushed without
+        # warning to education leads.
+        errors_text = "\n* ".join(errors)
+        comms.send_discord_message(
+            f"@EduLeads - {user_fullname()} is **bypassing validation errors** "
+            "to schedule class:\n\n"
+            f"* Instructor: {m.name} ({m.email})\n"
+            f"* Class: {c.name} ($" + f"{c.price}, {c.capacity} students)\n"
+            f"* Sessions: {', '.join([s[0].strftime('%Y-%m-%d %-I:%M %p') for s in sessions])}\n\n"
+            f"Errors bypassed:\n\n* {errors_text}"
+            "\n\n**This event will likely schedule by tomorrow morning** - "
+            "if you think this is in error, cancel the proposed class via "
+            "the [instructor dashboard](https://api.protohaven.org/instructor) "
+            "and follow up immediately with the scheduling user.",
+            "#education-leads",
+            blocking=True,
+        )
 
     # We automatically confirm classes pushed via instructor dashboard since the instructor
     # is the one pushing the class.
     scheduler.push_class_to_schedule(inst_id, cls_id, sessions)
+
     return {"valid": True, "errors": [], "success": True}
 
 
@@ -464,6 +481,46 @@ def cancel_class():
     return {"success": True}
 
 
+@page.route("/instructor/submissions", methods=["GET"])
+@require_login_role(Role.INSTRUCTOR, Role.EDUCATION_LEAD, Role.STAFF)
+def recent_instructor_submissions():
+    """Returns instructor submissions for the logged in instructor.
+    Note that not all submission through time are guaranteed to be returned
+    """
+    target_email = request.args.get("email")
+    if target_email is not None:
+        ue = user_email()
+        if ue != target_email and not am_role(
+            Role.ADMIN, Role.EDUCATION_LEAD, Role.STAFF
+        ):
+            return Response("Access Denied for admin parameter `email`", status=401)
+        email = target_email
+    else:
+        email = user_email()
+        if not email:
+            return Response("You are not logged in.", status=401)
+
+    email = email.strip().lower()
+    log.info(f"Lookup submissions with instructor email {email}")
+    result = {}
+    for sub in sheets.get_instructor_submissions_raw():
+        if "Email Address" not in sub:
+            continue
+        sub_email = sub["Email Address"].strip().lower()
+        if sub_email != email:
+            continue
+        if (
+            "Neon Event ID (please ignore)" not in sub
+            or not sub["Neon Event ID (please ignore)"]
+        ):
+            continue
+        event_id = sub["Neon Event ID (please ignore)"].strip()
+        if event_id not in result:
+            result[event_id] = []
+        result[event_id].append(sub.get("Timestamp"))
+    return result
+
+
 @page.route("/instructor/clearance_quiz", methods=["POST"])
 @require_login_role(Role.AUTOMATION, Role.INSTRUCTOR)
 def log_quiz_submission():
@@ -482,3 +539,25 @@ def log_quiz_submission():
         data=req.get("data") or {},
     )
     return {"status": status, "content": content}
+
+
+@page.route("/instructor/enroll", methods=["POST"])
+@require_login_role(Role.EDUCATION_LEAD, Role.STAFF, redirect_to_login=False)
+def instructor_enroll():
+    """Enroll a Neon account as an instructor, via email"""
+    data = request.json
+    create_acct = data.get("create_account", False)
+
+    # Check if we need to create a new account
+    if create_acct:
+        name = data.get("name", "")
+        email = data.get("email", "")
+        try:
+            nid = neon.create_member(name, email)
+            return neon.patch_member_role(nid, Role.INSTRUCTOR, data["enroll"])
+        except (RuntimeError, KeyError, ValueError) as e:
+            log.error(f"Failed to create and enroll member {name} ({email}): {e}")
+            return {"error": f"Failed to create account: {str(e)}"}, 500
+
+    # Existing account enrollment/disenrollment
+    return neon.patch_member_role(data["neon_id"], Role.INSTRUCTOR, data["enroll"])

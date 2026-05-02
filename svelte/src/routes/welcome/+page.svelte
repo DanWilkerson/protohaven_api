@@ -7,6 +7,7 @@
   import SigninOk from '$lib/signin_ok.svelte';
   import MembershipExpired from '$lib/membership_expired.svelte';
 	import Waiver from '$lib/waiver.svelte';
+  import MemberAgreement from '$lib/member_agreement.svelte';
   let state='splash';
   let name='member';
   let email=null;
@@ -14,6 +15,7 @@
   let checking=false;
   let progress=null;
   let waiver_ack=false;
+  let member_agreement_accepted=false;
   let dependent_info="";
 	let feedback=null;
   let referrer = "";
@@ -21,6 +23,7 @@
 
   let announcements = [];
   let violations = [];
+  let reservations = [];
 
   onMount(() => {
     console.log("Base WS:", base_ws());
@@ -29,6 +32,7 @@
       console.log("testing mode enabled; test announcements will be fetched");
     }
   });
+
 
 
   async function on_splash_submit(p) {
@@ -41,9 +45,14 @@
     return await submit();
   }
 
+  async function member_agreement_agreed() {
+    member_agreement_accepted=true;
+    return await submit();
+  }
+
   function do_post(silent=false) {
     // We capture the data at the time of invocation to prevent data from getting cleared asynchronously
-    let capture = JSON.stringify({email, person, waiver_ack, dependent_info, referrer, testing});
+    let capture = JSON.stringify({email, person, waiver_ack, member_agreement_accepted, dependent_info, referrer, testing});
     return new Promise((resolve, reject) => {
       const socket = open_ws("/welcome/ws")
       socket.addEventListener("open", (event) => {
@@ -70,11 +79,13 @@
     email = null;
     person = 'member';
     waiver_ack = false;
+    member_agreement_accepted = false;
     referrer = '';
     feedback = null;
     state = 'splash';
     announcements = [];
     violations = [];
+    reservations = [];
   }
 
   function on_signin_return(survey_response) {
@@ -105,7 +116,7 @@
     name = result.firstname;
     announcements = result.announcements;
     violations = result.violations;
-
+    reservations = result.reservations;
     if (person !== 'guest' && result.status !== 'Active') {
       // Expired membership takes priority in notification
       state = 'membership_expired';
@@ -117,8 +128,16 @@
       return;
     }
 
+    // Check member agreement for members only
+    if (person === 'member' && !result.member_agreement_accepted) {
+      state = 'member_agreement';
+      return;
+    }
+
     // If everything else is good, we're good.
-    state = 'signin_ok';
+    // Put this in a setTimeout so that we escape the event
+    // and don't accidentally trigger an enter-based return event
+    setTimeout(() => state = 'signin_ok', 50);
   }
 </script>
 
@@ -131,13 +150,25 @@
       <Splash bind:email={email} bind:dependent_info={dependent_info} {feedback} {progress} on_member={()=>on_splash_submit('member')} on_guest={()=>on_splash_submit('guest')}/>
     {:else if state == 'waiver' }
       <Waiver name={name} on_submit={waiver_agreed} checking={checking}/>
+    {:else if state == 'member_agreement' }
+      <MemberAgreement on_submit={member_agreement_agreed} checking={checking}/>
     {:else if state == 'membership_expired' }
       <MembershipExpired name={name} on_close={restart_flow}/>
     {:else if state == 'signin_ok'}
-      <SigninOk {name} {email} guest={person == 'guest'} {announcements} {violations} on_close={on_signin_return}/>
+      <SigninOk {name} {email} guest={person == 'guest'} {announcements} {violations} {reservations} on_close={on_signin_return}/>
     {/if}
 	</Row>
 </main>
+
+<svelte:window
+    on:keyup={(e) => {
+      if (e.key == 'Enter' && state==="signin_ok") {
+        console.log("triggering on_signin_return from keypress");
+        on_signin_return();
+      }
+    }}
+/>
+
 
 
 <style>

@@ -293,11 +293,29 @@ TESTED_TEMPLATES = [
             ]
         },
     ),
+    (
+        "neon_backup_summary",
+        {
+            "stats": [
+                {"name": "db.ext", "drive_id": "CDE", "size_kb": 123},
+                {"name": "files.ext", "drive_id": "ABC", "size_kb": 456},
+            ],
+            "category": "accounts",
+            "parent_id": "PAR",
+        },
+    ),
     ("new_project_request", {"notes": "test_notes"}),
     ("not_associated", {"discord_id": "testid"}),
     (
         "phone_message",
         {"msg_header": "stuff and things", "notes": "This is a message", "date": d(0)},
+    ),
+    (
+        "orphaned_reservations_cleanup",
+        {
+            "n": 2,
+            "changes": ["reservation 1", "reservation 2"],
+        },
     ),
     (
         "recertification_summary",
@@ -440,8 +458,10 @@ HASHES = {
     "membership_activated": "8a27b2ff8900b48b",  # pragma: allowlist secret
     "membership_init_summary": "586bb53336cbac1f",  # pragma: allowlist secret
     "membership_validation_problems": "07e7e586afd0dd5e",  # pragma: allowlist secret
+    "neon_backup_summary": "33e2ac11fce96ebd",  # pragma: allowlist secret
     "new_project_request": "4cffeae1816d93a2",  # pragma: allowlist secret
     "not_associated": "4368092931234979",  # pragma: allowlist secret
+    "orphaned_reservations_cleanup": "0c1949b6eae33b9b",  # pragma: allowlist secret
     "phone_message": "c17d7359c5ddace4",  # pragma: allowlist secret
     "recertification_summary": "a360e54dcfdbe688",  # pragma: allowlist secret
     "registrant_class_canceled": "a3b36f01fde3ee4c",  # pragma: allowlist secret

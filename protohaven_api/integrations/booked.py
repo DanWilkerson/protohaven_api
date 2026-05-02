@@ -4,7 +4,7 @@ import datetime
 import logging
 import secrets
 from collections import defaultdict
-from typing import Iterable
+from typing import Any, Iterable
 
 from protohaven_api.config import get_config, safe_parse_datetime, tznow
 from protohaven_api.integrations.airtable import AreaID, Interval, ToolCode
@@ -167,6 +167,21 @@ def get_reservations_for_areas(
         if str(res["userid"]) != user_id:
             continue
         if res["resourceId"] not in resource_filter:
+            continue
+        yield res
+
+
+def get_automation_reservations(interval: Interval, user_id=None) -> Iterable[dict]:
+    """Fetches all reservations made by the automation user within a time interval.
+
+    This is similar to get_reservations_for_areas but doesn't filter by area.
+    Useful for finding all automation-created reservations regardless of area.
+    """
+    user_id = user_id or str(get_config("booked/automation_user_id"))
+    assert user_id
+
+    for res in get_reservations(*interval)["reservations"]:
+        if str(res["userId"]) != user_id:
             continue
         yield res
 
@@ -344,20 +359,29 @@ class ReservationCache(WarmDict):
     REFRESH_PD_SEC = datetime.timedelta(minutes=5).total_seconds()
     RETRY_PD_SEC = datetime.timedelta(minutes=5).total_seconds()
 
-    def __init__(self, update_cb):
+    def __init__(self, update_cb=None):
         self.cb = update_cb
         super().__init__()
 
     def refresh(self):
         start = tznow()
         end = start.replace(hour=23, minute=59, second=59)
-        self["reservations"] = get_reservations(start, end)["reservations"]
-        self.log.debug("Reservation cache updated")
-        self.cb(self)
+        res = get_reservations(start, end)
+        self["reservations"] = res["reservations"]
+        self.log.info(
+            f"Reservation cache updated - {len(self['reservations'])} reservation(s)"
+        )
+        if self.cb:
+            self.cb(self)
         # We can be less aggressive outside of normal business hours
         self.REFRESH_PD_SEC = datetime.timedelta(  # pylint: disable=invalid-name
             minutes=15 if 10 <= start.hour <= 22 else 60
         ).total_seconds()
+
+    def get_next_24h_reservations(self) -> Iterable[Any]:
+        """Fetches the raw contents of the cache"""
+        log.info(f"Returning reservations: {self['reservations']}")
+        return self["reservations"]
 
     def get_today_reservations_by_tool(self):
         """Fetches today's reservations, keyed by tool code"""
@@ -377,3 +401,6 @@ class ReservationCache(WarmDict):
                     }
                 )
         return result
+
+
+cache = ReservationCache()

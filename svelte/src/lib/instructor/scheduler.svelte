@@ -12,7 +12,7 @@
 
   let ovr = false;
   let validation_override = "";
-  $: ovr = (validation_override.replaceAll("\"", "").toLowerCase().trim() === "i own the consequences of my actions");
+  $: ovr = (validation_override.length > 32);
 
   function day_of_week(date) {
       const days = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
@@ -32,8 +32,8 @@
 
   function candidate_times(session_duration) {
     let times = [];
-    const MAX_HR = (admin) ? 24 : 22 - session_duration; // 10pm is close
-    const MIN_HR = (admin) ? 0 : 10; // 10am is open
+    const MAX_HR = 24;
+    const MIN_HR = 0;
     for (let hour = MIN_HR; hour <= MAX_HR; hour++) { // 10am is open
       for (let minute of (hour < MAX_HR) ? [0, 30] : [0]) {
         const h = hour.toString().padStart(2, '0');
@@ -71,10 +71,10 @@
       console.log(date, time);
       // https://www.javaspring.net/blog/date-parsing-in-javascript-is-different-between-safari-and-chrome/#3-why-these-differences-exist-root-causes
       // Kind of a hacky way to create a date, but at least it's compatible and works EST/EDT
-      const t1 = new Date(date);
-      const [hr, min] = time.split(':');
-      t1.setHours(parseInt(hr));
-      t1.setMinutes(parseInt(min));
+      // Note that Date.parse applies local system timezone when it has
+      // both date and time
+      // See https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/Date/parse
+      const t1 = new Date(Date.parse(date + `T${time}:00`));
       console.log(t1);
 
       const t2 = new Date(t1.getTime() + selected.tmpl.hours[i] * 60 * 60 * 1000);
@@ -214,17 +214,20 @@
         <ListGroupItem color="warning">{e}</ListGroupItem>
       {/each}
       </ListGroup>
-
-      {#if admin}
-        <Input class="my-3" type="text" placeholder={"Type \"I own the consequences of my actions\" here to ignore all errors and proceed"} bind:value={validation_override} />
+      <p><em>Type "I own the consequences of my actions" into the box below to ignore all errors and proceed.</em></p>
+      <Input class="my-3" type="text" placeholder="" bind:value={validation_override} />
+      {#if validation_override}
+      <p><em>An automated message will be sent to the Education Leads, but <strong>you are responsible for telling them about this class being scheduled without validation.</strong></em></p>
       {/if}
     {/if}
   </ModalBody>
   <ModalFooter>
     {#if running }<Spinner/>Validating....{/if}
     {#if !running && validation_result.valid}All validation checks passed <Icon name="check-all"/>{/if}
-    {#if selected && !running && !validation_result.valid}Some validation checks failed <Icon name="exclamation-triangle"/>{/if}
-    <Button on:click={save_schedule} disabled={!ovr && (running || !validation_result.valid)}>Save proposed classes</Button>
+    {#if selected && !running && !validation_result.valid}Some validation checks failed <Icon name="exclamation-triangle"/>
+    {#if ovr}<strong> proceed anyways?</strong>{/if}
+    {/if}
+    <Button on:click={save_schedule} disabled={!ovr && (running || !validation_result.valid)}>Save</Button>
     <Button on:click={() => open = false} disabled={running}>Close</Button>
   </ModalFooter>
 </Modal>

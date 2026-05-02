@@ -9,7 +9,7 @@ import urllib.parse
 from collections import defaultdict
 from dataclasses import asdict, dataclass
 from functools import lru_cache
-from typing import Any, Iterator
+from typing import Any, Iterable
 
 from dateutil import parser as dateparser
 
@@ -26,15 +26,17 @@ from protohaven_api.integrations.airtable_base import (
     update_record,
 )
 from protohaven_api.integrations.data.warm_cache import WarmDict
-from protohaven_api.integrations.models import SignInEvent
+from protohaven_api.integrations.models import (
+    AreaID,
+    ClearanceCodeFull,
+    EventID,
+    NeonID,
+    SignInEvent,
+    ToolCode,
+)
 
 log = logging.getLogger("integrations.airtable")
 
-Email = str
-NeonID = str
-EventID = str  # Neon or Eventbrite event ID
-ToolCode = str
-AreaID = str
 RecordID = str
 ForecastOverride = tuple[str, list[str], str]
 Interval = tuple[datetime.datetime, datetime.datetime]
@@ -49,13 +51,14 @@ class Class:  # pylint: disable=too-many-instance-attributes
     hours: list[int]
     capacity: int
     price: int
+    supply_cost: int
     period: datetime.timedelta
     approved: bool
     schedulable: bool
     approved_instructors: list[NeonID]
     areas: list[AreaID]
     image_link: str
-    clearances: list[ToolCode]
+    clearances: list[ClearanceCodeFull]
 
     @classmethod
     def resolve_hours(cls, hours, days) -> list[float]:
@@ -78,13 +81,14 @@ class Class:  # pylint: disable=too-many-instance-attributes
             hours=cls.resolve_hours(f.get("Hours"), f.get("Days")),
             capacity=int(f.get("Capacity") or 0),
             price=int(f.get("Price") or 0),
+            supply_cost=int(f.get("Supply Cost") or 0),
             period=datetime.timedelta(days=int(f.get("Period") or 0)),
             areas=f.get("Name (from Area)") or [],
             schedulable=bool(f.get("Schedulable")),
             approved=bool(f.get("Approved")),
             image_link=f.get("Image Link"),
             clearances=f.get("Form Name (from Clearance)") or [],
-            approved_instructors=f.get("Email (from Instructor Capabilities)") or [],
+            approved_instructors=f.get("Neon ID (from Instructor Capabilities)") or [],
         )
 
     @property
@@ -126,16 +130,6 @@ class ScheduledClass:  # pylint: disable=too-many-instance-attributes
     description: dict[str, str]
 
     @classmethod
-    def resolve_starts(cls, sessions, start_time, days, days_between):
-        """Compatibility for old table data"""
-        if sessions:
-            return [safe_parse_datetime(d) for d in sessions.split(",")]
-        d = safe_parse_datetime(start_time)
-        return [
-            d + datetime.timedelta(days=i * int(days_between)) for i in range(int(days))
-        ]
-
-    @classmethod
     def from_schedule(cls, row):
         """Converts airtable schedule row into ScheduledClass"""
         f = row["fields"]
@@ -144,14 +138,12 @@ class ScheduledClass:  # pylint: disable=too-many-instance-attributes
             _unwrap(f, "Days (from Class)"),
         )
         if not hours:
-            raise RuntimeError("Class template data for session has no hours listed")
-
-        starts = cls.resolve_starts(
-            f.get("Sessions") or None,
-            f.get("Start Time") or None,
-            _unwrap(f, "Days (from Class)"),
-            _unwrap(f, "Days Between Sessions (from Class)"),
-        )
+            raise RuntimeError(
+                f"Class template data for session has no hours listed: {f}"
+            )
+        if not f.get("Sessions"):
+            raise RuntimeError(f"Scheduled class has no Sessions field data: {f}")
+        starts = [safe_parse_datetime(d) for d in f.get("Sessions").split(",")]
         if len(hours) < len(
             starts
         ):  # We need consistent lengths for pairing up data elsewhere
@@ -201,6 +193,17 @@ class ScheduledClass:  # pylint: disable=too-many-instance-attributes
             },
         )
 
+    def form_fmt_hours(self, h: float) -> str:
+        """Selects the closest hour input for form data"""
+        val = round(h * 2) / 2
+        if val < 0:
+            return "0"
+        if val > 8:
+            return "8"
+        if val.is_integer():
+            return str(int(val))
+        return f"{val:.1f}"
+
     def prefill_form(self, pass_emails: list[str], session_idx: int = 0):
         """Return prefilled instructor log submission form"""
         individual = get_instructor_log_tool_codes()
@@ -223,7 +226,9 @@ class ScheduledClass:  # pylint: disable=too-many-instance-attributes
             f"&{form_keys['instructor']}={urllib.parse.quote(self.instructor_name)}"
         )
         result += f"&{form_keys['date']}={start_yyyy_mm_dd}"
-        result += f"&{form_keys['hours']}={self.hours[session_idx]}"
+        result += (
+            f"&{form_keys['hours']}={self.form_fmt_hours(self.hours[session_idx])}"
+        )
         result += f"&{form_keys['class_name']}={urllib.parse.quote(self.name)}"
         if self.volunteer:
             result += f"&{form_keys['volunteer']}={form_values['volunteer_yes']}"
@@ -289,19 +294,17 @@ def _unwrap(row, field):
     return v
 
 
-def get_class_automation_schedule(include_rejected=True, raw=True):
+def get_class_automation_schedule(include_rejected=True, raw=False):
     """Grab the current automated class schedule"""
     for row in get_all_records("class_automation", "schedule"):
         if not row["fields"].get("Rejected") or include_rejected:
             yield (row if raw else ScheduledClass.from_schedule(row))
 
 
-def get_scheduled_class(rec, raw=True):
+def get_scheduled_class(rec):
     """Get the specific scheduled class row by reference"""
     result = get_record("class_automation", "schedule", rec)
-    if result and not raw:
-        return ScheduledClass.from_schedule(result)
-    return result
+    return ScheduledClass.from_schedule(result)
 
 
 def get_notifications_after(tag, after_date):
@@ -403,7 +406,7 @@ def get_class_template(cls_id: RecordID) -> Class:
 
 
 def append_classes_to_schedule(payload):
-    """Takes {Instructor, Email, Start Time, [Class]} and adds to schedule"""
+    """Takes {Instructor, Email, Sessions, [Class]} and adds to schedule"""
     assert isinstance(payload, list)
     for c in payload:  # Ensure correct format for linking
         c["Class"] = [_refid(i) for i in c["Class"]]
@@ -457,7 +460,7 @@ def respond_class_automation_schedule(eid: RecordID, pub: bool) -> ScheduledClas
     status, result = update_record(data, "class_automation", "schedule", eid)
     if status != 200:
         raise RuntimeError(f"Error updating class schedule state for {eid}: {result}")
-    return get_scheduled_class(eid, raw=False)
+    return get_scheduled_class(eid)
 
 
 def apply_violation_accrual(vid, accrued):
@@ -485,7 +488,7 @@ def mark_schedule_supply_request(eid: RecordID, state) -> ScheduledClass:
     )
     if status != 200:
         raise RuntimeError(f"Error setting supply state for {eid}: {result}")
-    return get_scheduled_class(eid, raw=False)
+    return get_scheduled_class(eid)
 
 
 def mark_schedule_volunteer(eid: RecordID, volunteer: bool) -> ScheduledClass:
@@ -495,7 +498,7 @@ def mark_schedule_volunteer(eid: RecordID, volunteer: bool) -> ScheduledClass:
     )
     if status != 200:
         raise RuntimeError(f"Error setting volunteer status for {eid}: {result}")
-    return get_scheduled_class(eid, raw=False)
+    return get_scheduled_class(eid)
 
 
 def get_tools():
@@ -573,7 +576,7 @@ class PendingRecert:
     rec_id: RecordID | None
 
 
-def get_pending_recertifications() -> Iterator[PendingRecert]:
+def get_pending_recertifications() -> Iterable[PendingRecert]:
     """Get all pending recerts"""
     for rec in get_all_records("people", "recertification"):
         if not rec["fields"].get("Tool Code"):
@@ -707,7 +710,7 @@ def get_all_tech_bios():
     return list(get_all_records("people", "volunteers_staff"))
 
 
-def get_signins_between(start, end) -> Iterator[SignInEvent | None]:
+def get_signins_between(start, end) -> Iterable[SignInEvent | None]:
     """Fetches all sign-in data between two dates; or after `start` if `end` is None"""
     if not end:
         for rec in get_all_records_after("people", "sign_ins", start):
@@ -865,7 +868,7 @@ def _day_trunc(d):
     return d.replace(hour=0, minute=0, second=0, microsecond=0)
 
 
-def get_forecast_overrides(include_pii) -> Iterator[tuple[str, ForecastOverride]]:
+def get_forecast_overrides(include_pii) -> Iterable[tuple[str, ForecastOverride]]:
     """Gets all overrides for the shop tech shift forecast"""
     for r in get_all_records("people", "shop_tech_forecast_overrides"):
         if r["fields"].get("Shift Start", None) is None:
@@ -958,6 +961,17 @@ def get_latest_passing_quizzes_by_email_and_tool(
     return result
 
 
+def get_storage_agreements() -> Iterable[dict[str, Any]]:
+    """Gets all storage agreements from Airtable"""
+    for row in get_all_records("people", "storage_agreements"):
+        yield {
+            **row["fields"],
+            "id": row["id"],
+            "Start Date": safe_parse_datetime(row["fields"]["Start Date"]),
+            "End Date": safe_parse_datetime(row["fields"]["End Date"]),
+        }
+
+
 class AirtableCache(WarmDict):
     """Prefetches airtable data for faster lookup"""
 
@@ -985,14 +999,16 @@ class AirtableCache(WarmDict):
                 continue
             yield pv
 
-    def announcements_after(self, d, roles, clearances):
+    def announcements_after(
+        self, d: datetime.datetime, roles, clearances: Iterable[ClearanceCodeFull]
+    ):
         """Gets all announcements, excluding those before `d`"""
         now = tznow()
 
         # Neon clearance data is of the format `<TOOL_CODE>: <TOOL_NAME>`.
         # announcements_after expects a set of tool names.
         log.info(f"Clearances: {clearances}")
-        clearances = [n.split(":")[1].strip() for n in clearances if ":" in n]
+        tool_names = [n.split(":")[1].strip() for n in clearances if ":" in n]
 
         for row in self["announcements"]:
             adate = safe_parse_datetime(row["fields"].get("Published", "2024-01-01"))
@@ -1002,7 +1018,7 @@ class AirtableCache(WarmDict):
             tools = set(row["fields"].get("Tool Name (from Tool Codes)", []))
             if len(tools) > 0:
                 cleared_for_tool = False
-                for c in clearances:
+                for c in tool_names:
                     if c in tools:
                         cleared_for_tool = True
                         break
@@ -1017,3 +1033,43 @@ class AirtableCache(WarmDict):
 
 
 cache = AirtableCache()
+
+
+def get_all_instructor_capabilities_formatted():
+    """Fetches and returns all instructor bios and photos from airtable/nocodb"""
+    bios = []
+    for inst in get_all_records("class_automation", "capabilities"):
+        fields = inst["fields"]
+        bio = {
+            "id": str(inst["id"]),
+            "name": fields.get("Instructor") or "unknown",
+            "email": fields.get("Email") or "unknown",
+            "neon_id": fields.get("Neon ID") or None,
+            "active": fields.get("Active") or False,
+            "w9": fields.get("W9 Form"),
+            "direct_deposit": fields.get("Direct Deposit Info"),
+            "bio": fields.get("Bio"),
+            "profile_pic": None,
+            "classes": [],
+            "clearances": fields.get("Clearances") or [],
+            "discord_user": fields.get("Discord User"),
+            "notes": fields.get("Notes"),
+        }
+
+        # Handle profile picture
+        img = (fields.get("Profile Pic") or [{"url": None}])[0]
+        if img:
+            bio["profile_pic"] = (
+                img.get("url")
+                or f"{get_config('nocodb/requests/url')}/{img.get('path')}"
+            )
+
+        # Handle classes
+        if "Class" in fields.keys():
+            class_ids = _idref(inst, "Class")
+            bio["classes"] = {
+                str(c[0]): c[1] for c in zip(class_ids, fields["Name (from Class)"])
+            }
+
+        bios.append(bio)
+    return bios

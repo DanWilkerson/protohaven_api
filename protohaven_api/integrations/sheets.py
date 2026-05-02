@@ -9,7 +9,7 @@ from google.oauth2 import service_account
 from googleapiclient.discovery import build
 
 from protohaven_api.config import get_config, safe_parse_datetime
-from protohaven_api.integrations.airtable import Email, ToolCode
+from protohaven_api.integrations.models import ClearanceCodeShort, Email
 
 log = logging.getLogger("integrations.sheets")
 
@@ -37,10 +37,13 @@ def get_sheet_range(sheet_id, range_name):
 
 
 def get_instructor_submissions_raw(from_row=1300):
-    """Get log submissions from instructors"""
+    """Get log submissions from instructors
+
+    Note: columns up to Neon ID are included
+    """
     sheet_id = get_config("sheets/ids/instructor_hours")
-    headers = get_sheet_range(sheet_id, "Form Responses 1!A1:M")[0]
-    for row in get_sheet_range(sheet_id, f"Form Responses 1!A{from_row}:M"):
+    headers = get_sheet_range(sheet_id, "Form Responses 1!A1:N")[0]
+    for row in get_sheet_range(sheet_id, f"Form Responses 1!A{from_row}:N"):
         data = dict(zip(headers, row))
         if not data.get("Timestamp"):
             continue
@@ -50,12 +53,12 @@ def get_instructor_submissions_raw(from_row=1300):
 
 PASS_HDR = "Protohaven emails of each student who PASSED (This should be the email address they used to sign up for the class or for their Protohaven account). If none of them passed, enter N/A."  # pylint: disable=line-too-long
 CLEARANCE_HDR = "Which clearance(s) was covered?"
-TOOLS_HDR = "Which tools?"
+TOOLS_HDR = "Which tools were cleared (if any?)"
 
 
 def get_passing_student_clearances(
     dt=None, from_row=1300
-) -> Iterator[tuple[Email, list[ToolCode], datetime.datetime]]:
+) -> Iterator[tuple[Email, list[ClearanceCodeShort], datetime.datetime]]:
     """Minimally parse and return instructor submissions after from_row in the sheet.
     Yields a sequence of clearance info for each student that passed a class.
     """
@@ -72,7 +75,8 @@ def get_passing_student_clearances(
 
         tool_codes = sub.get(TOOLS_HDR)
         tool_codes = (
-            [s.split(":")[0].strip() for s in tool_codes.split(",")]
+            # Handle e.g. "Welding - WGR: Tungsten Grinder" -> "WGR"
+            [s.split(":")[0].split(" ")[-1].strip() for s in tool_codes.split(",")]
             if tool_codes
             else None
         )

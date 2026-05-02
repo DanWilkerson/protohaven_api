@@ -1,9 +1,15 @@
 """Neon CRM integration methods"""  # pylint: disable=too-many-lines
 
 import datetime
+import json
 import logging
 import re
+import tarfile
+import tempfile
+from dataclasses import dataclass
 from functools import lru_cache
+from os.path import getsize
+from pathlib import Path
 from typing import Iterable
 
 import rapidfuzz
@@ -13,12 +19,23 @@ from protohaven_api.config import tznow, utcnow
 from protohaven_api.integrations import neon_base
 from protohaven_api.integrations.data.neon import CustomField
 from protohaven_api.integrations.data.warm_cache import WarmDict
-from protohaven_api.integrations.models import Attendee, Event, Member, NeonID
+from protohaven_api.integrations.models import (
+    Attendee,
+    ClearanceCodeFull,
+    ClearanceCodeShort,
+    Event,
+    EventID,
+    Member,
+    NeonID,
+    ToolCode,
+)
 
 log = logging.getLogger("integrations.neon")
 
 
-def _search_upcoming_events(from_date, to_date):
+def _search_upcoming_events(
+    from_date: datetime.datetime, to_date: datetime.datetime
+) -> Iterable[Event]:
     """Lookup upcoming events"""
     for evt in neon_base.paginated_search(
         [
@@ -41,7 +58,7 @@ def _search_upcoming_events(from_date, to_date):
         yield Event.from_neon_search(evt)
 
 
-def fetch_event(event_id, tickets=False, attendees=False):
+def fetch_event(event_id: EventID, tickets=False, attendees=False):
     """Fetch data on an individual (legacy) event in Neon"""
     evt = Event.from_neon_fetch(neon_base.get("api_key1", f"/events/{event_id}"))
     if tickets:
@@ -115,14 +132,56 @@ def fetch_attendees(event_id: str, raw=False) -> Iterable[Attendee]:
         yield result if raw else Attendee(neon_raw_data=result)
 
 
+def resolve_clearance_code_full(
+    t: ToolCode | ClearanceCodeShort,
+) -> ClearanceCodeFull | None:
+    """Resolves a tool or clearance code to the full clearance code,
+    or None if the tool has no clearance code.
+
+    Clearance codes always match the code for the tool,
+    minus the integer suffix that indicates the instance of the tool.
+
+    e.g.:
+
+        "FRG2" -> "FRG: Forge"
+        "WGR" -> "WGR: Tungsten Grinder"
+
+    Note that there is a "legacy" fallback if e.g. a clearance
+    exists such as "FRG2: Forge 2".
+    """
+    canonical = t.rstrip("1234567890").upper()
+    legacy = t.upper()
+    return (
+        _clearance_code_map().get(canonical)
+        or _clearance_code_map().get(legacy)
+        or None
+    )
+
+
 @lru_cache(maxsize=1)
-def fetch_clearance_codes():
+def _clearance_code_map() -> dict[ClearanceCodeShort, ClearanceCodeFull]:
+    return {c.short: c.full for c in fetch_clearance_codes()}
+
+
+@dataclass
+class ClearanceCodeData:
+    """Data from Neon custom field fetch"""
+
+    id: int
+    short: ClearanceCodeShort
+    full: ClearanceCodeFull
+
+
+@lru_cache(maxsize=1)
+def fetch_clearance_codes() -> list[ClearanceCodeData]:
     """Fetch all the possible clearance codes that can be used in Neon"""
     rep = neon_base.get("api_key1", f"/customFields/{CustomField.CLEARANCES}")
     result = []
     for c in rep["optionValues"]:
         code, _ = c["name"].split(":")
-        result.append({**c, "code": code.strip().upper()})
+        result.append(
+            ClearanceCodeData(id=c["id"], full=c["name"], short=code.strip().upper())
+        )
     return result
 
 
@@ -232,6 +291,67 @@ def search_all_members(
     )
 
 
+def make_tarfile(output_filename: str, source_dir: str):
+    """https://stackoverflow.com/a/17081026"""
+    with tarfile.open(output_filename, "w:gz") as tar:
+        tar.add(source_dir, arcname="")
+
+
+def accounts_backup(
+    output_filename: str,
+    fname: str = "accounts.json",
+) -> int:
+    """Iterate through all account information on Neon CRM and write it
+    into a gzipped tar file. Returns number of bytes of the archive"""
+    with tempfile.TemporaryDirectory() as d:
+        results = []
+        for m in search_all_members(fields=[], also_fetch=True, fetch_memberships=True):
+            results.append({**m.neon_raw_data, "memberships": m.neon_membership_data})
+        with open(Path(d) / fname, "w", encoding="utf8") as f:
+            f.write(json.dumps(results))
+        make_tarfile(output_filename, str(d))
+    return getsize(output_filename)
+
+
+def events_backup(
+    output_filename: str,
+    fname: str = "events.json",
+    max_age_days: int = 10 * 365,
+) -> int:
+    """Iterate through all events on Neon CRM and write to a gzipped tar file.
+    Return number of bytes of the archive.
+    Events older than 10 years are not returned.
+    """
+    with tempfile.TemporaryDirectory() as d:
+        results = []
+        for e in neon_base.paginated_search(
+            [
+                (
+                    "Event Start Date",
+                    "GREATER_AND_EQUAL",
+                    (tznow() - datetime.timedelta(days=max_age_days)).strftime(
+                        "%Y-%m-%d"
+                    ),
+                ),
+            ],
+            ["Event ID"],
+            typ="events",
+        ):
+            evt = fetch_event(e["Event ID"], attendees=True, tickets=True)
+            results.append(
+                {
+                    **evt.neon_raw_data,
+                    "attendees": evt.neon_attendee_data,
+                    "tickets": evt.neon_ticket_data,
+                }
+            )
+
+        with open(Path(d) / fname, "w", encoding="utf8") as f:
+            f.write(json.dumps(results))
+        make_tarfile(output_filename, str(d))
+    return getsize(output_filename)
+
+
 MEMBER_SEARCH_OUTPUT_FIELDS = [
     "Household ID",
     "Company ID",
@@ -245,6 +365,7 @@ MEMBER_SEARCH_OUTPUT_FIELDS = [
     CustomField.CLEARANCES,
     CustomField.DISCORD_USER,
     CustomField.WAIVER_ACCEPTED,
+    CustomField.MEMBER_AGREEMENT_ACCEPTED,
     CustomField.ANNOUNCEMENTS_ACKNOWLEDGED,
     CustomField.API_SERVER_ROLE,
     CustomField.NOTIFY_BOARD_AND_STAFF,
@@ -262,7 +383,11 @@ def _search_members_internal(
     return multiple results."""
 
     if merge_bios:
-        merge_bios = {row["fields"]["Email"].strip().lower(): row for row in merge_bios}
+        merge_bios = {
+            row["fields"]["Email"].strip().lower(): row
+            for row in merge_bios
+            if "Email" in row["fields"]
+        }
 
     for acct in neon_base.paginated_search(
         params,
@@ -427,6 +552,9 @@ def create_coupon_codes(codes, amt, from_date=None, to_date=None):
 
 def create_member(name: str, email: str) -> NeonID:
     """Create a new member in Neon with the given name and email"""
+    if not name or not email:
+        raise RuntimeError("Name and email are required")
+
     # Check if member already exists
     existing = list(search_members_by_email(email))
     if existing:
@@ -456,7 +584,7 @@ def create_member(name: str, email: str) -> NeonID:
         result = neon_base.post("api_key2", "/accounts", account_data)
         # The API returns the created account data
         # We need to fetch it to get the full Member object
-        account_id = result.get("accountId")
+        account_id = result.get("id")
         if not account_id:
             raise RuntimeError(f"Failed to create account: {result}")
         return account_id
@@ -480,15 +608,18 @@ def patch_member_role(neon_id: NeonID, role, enabled: bool):
 
 
 def set_tech_custom_fields(  # pylint: disable=too-many-arguments
-    account_id,
-    shop_tech_shift=None,
-    shop_tech_first_day=None,
-    shop_tech_last_day=None,
-    area_lead=None,
-    interest=None,
-    expertise=None,
+    account_id: NeonID,
+    shop_tech_shift: list | str = None,
+    shop_tech_first_day: str = None,
+    shop_tech_last_day: str = None,
+    area_lead: str = None,
+    interest: str = None,
+    expertise: str = None,
 ):
     """Sets custom fields on a shop tech Neon account"""
+    if isinstance(shop_tech_shift, list):
+        shop_tech_shift = " ".join(shop_tech_shift)
+
     cf = [
         (CustomField.SHOP_TECH_SHIFT, shop_tech_shift),
         (CustomField.SHOP_TECH_FIRST_DAY, shop_tech_first_day),
@@ -504,6 +635,13 @@ def set_waiver_status(account_id, new_status):
     """Overwrites existing waiver status information on an account"""
     return neon_base.set_custom_fields(
         account_id, (CustomField.WAIVER_ACCEPTED, new_status)
+    )
+
+
+def set_member_agreement_status(account_id, new_status):
+    """Overwrites existing member agreement status information on an account"""
+    return neon_base.set_custom_fields(
+        account_id, (CustomField.MEMBER_AGREEMENT_ACCEPTED, new_status)
     )
 
 
